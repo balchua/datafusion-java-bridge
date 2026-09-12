@@ -391,6 +391,7 @@ Rust/DataFusion.
 * `docs/memory.md` — what DataFusion's memory limit does and does not cover
 * `docs/parquet-and-s3.md` — export/import flows, S3 configuration
 * `docs/benchmarking.md` — stage definitions and methodology
+* `docs/performance.md` — measured load/query performance across shapes and schema profiles
 
 ## Versions
 
