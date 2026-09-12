@@ -41,39 +41,40 @@ public final class DataFusionEngine implements AutoCloseable {
     private final String versionInfo;
 
     public DataFusionEngine(EngineConfig config) {
-        this.structAllocator = new RootAllocator(Long.MAX_VALUE);
-        long created;
-        try {
-            created = NativeEngine.engineCreate(config.toNativeJson());
-        } catch (RuntimeException | Error e) {
-            structAllocator.close();
-            throw e;
-        }
+        long created = NativeEngine.engineCreate(config.toNativeJson());
         if (created == 0) {
-            structAllocator.close();
             throw new DataFusionException(
                     "engine creation failed (see pending exception or prior log)");
         }
         this.handle = created;
         try {
             this.versionInfo = NativeEngine.engineVersion();
-        } catch (RuntimeException | Error e) {
-            // The native engine was created but the constructor cannot return a
-            // usable object; release it so the handle and allocator do not leak.
-            try {
-                NativeEngine.engineClose(created);
-            } catch (RuntimeException closeFailure) {
-                e.addSuppressed(closeFailure);
-            } finally {
-                structAllocator.close();
-            }
+        } catch (RuntimeException e) {
+            // The native engine was created but the constructor cannot return a usable
+            // object; release it so the handle does not leak.
+            NativeEngine.engineClose(created);
             throw e;
         }
+        // Created last: at this point there is no remaining failure path, so the
+        // allocator never needs conditional cleanup.
+        this.structAllocator = new RootAllocator(Long.MAX_VALUE);
     }
 
     /** Engine + library version metadata (rustc, DataFusion, arrow). */
     public String versionInfo() {
         return versionInfo;
+    }
+
+    /**
+     * Cleanup for an Arrow C Data Interface struct, usable as a try-with-resources
+     * resource. {@code close()} does not throw and performs {@code release()} (returning
+     * the retained Java buffers across the C Data Interface) before {@code close()}
+     * (freeing the struct memory).
+     */
+    @FunctionalInterface
+    private interface NativeStructCleanup extends AutoCloseable {
+        @Override
+        void close();
     }
 
     /**
@@ -90,12 +91,25 @@ public final class DataFusionEngine implements AutoCloseable {
         int columns = batch.getSchema().getFields().size();
 
         // Export through the C Data Interface: one schema struct + one array struct
-        // per column. Arrow Java retains the buffers (refcount++), zero copy.
-        try (ArrowSchema schemaStruct = ArrowSchema.allocateNew(structAllocator)) {
+        // per column. Arrow Java retains the buffers (refcount++), zero copy. The
+        // cleanup wrappers release() before close(); on the success path Rust's
+        // `from_raw` already nulled each release pointer, so release() is a no-op there.
+        ArrowSchema schemaStruct = ArrowSchema.allocateNew(structAllocator);
+        try (NativeStructCleanup schemaCleanup = () -> {
+            schemaStruct.release();
+            schemaStruct.close();
+        }) {
             Data.exportSchema(structAllocator, batch.getSchema(), null, schemaStruct);
             long[] arrayAddrs = new long[columns];
             ArrowArray[] arrayStructs = new ArrowArray[columns];
-            try {
+            try (NativeStructCleanup arraysCleanup = () -> {
+                for (ArrowArray a : arrayStructs) {
+                    if (a != null) {
+                        a.release();
+                        a.close();
+                    }
+                }
+            }) {
                 for (int i = 0; i < columns; i++) {
                     ArrowArray a = ArrowArray.allocateNew(structAllocator);
                     arrayStructs[i] = a;
@@ -105,18 +119,6 @@ public final class DataFusionEngine implements AutoCloseable {
                 long stagedId = NativeEngine.stageArrow(
                         handle, tableName, schemaStruct.memoryAddress(), arrayAddrs);
                 NativeEngine.commitTable(handle, tableName, stagedId);
-            } finally {
-                // On the success path Rust's `from_raw` already consumed each struct and
-                // nulled its release pointer, so `release()` is a no-op and `close()` just
-                // frees the small Java-side struct. `release()` is only load-bearing when
-                // `stageArrow` fails early (e.g. a column-count mismatch) and Rust never
-                // consumed some of the arrays.
-                for (ArrowArray a : arrayStructs) {
-                    if (a != null) {
-                        a.release();
-                        a.close();
-                    }
-                }
             }
         }
     }
@@ -130,6 +132,7 @@ public final class DataFusionEngine implements AutoCloseable {
     }
 
     /** Executes a SELECT query; results stream as Arrow batches. */
+    @SuppressWarnings("java:S2093") // the native query is released only on construction failure
     public QueryResult query(String sql) {
         ensureOpen();
         long queryId = NativeEngine.query(handle, sql);
@@ -139,14 +142,10 @@ public final class DataFusionEngine implements AutoCloseable {
         }
         try {
             return new QueryResult(this, queryId);
-        } catch (RuntimeException | Error e) {
-            // The native query is already registered; if the Java wrapper fails to
-            // construct, release it so it does not leak until engine.close().
-            try {
-                NativeEngine.resultClose(handle, queryId);
-            } catch (RuntimeException closeFailure) {
-                e.addSuppressed(closeFailure);
-            }
+        } catch (RuntimeException e) {
+            // The native query is already registered; if the Java wrapper cannot be
+            // constructed, release it so it does not leak until engine.close().
+            NativeEngine.resultClose(handle, queryId);
             throw e;
         }
     }

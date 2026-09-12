@@ -341,4 +341,18 @@ mod tests {
         let out = round_trip(&batch);
         assert_batches_equal(&batch, &out);
     }
+
+    #[test]
+    fn import_rejects_column_count_mismatch_without_panic() {
+        use crate::error::ErrorKind;
+
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
+        let mut schema_mem = [0usize; 24];
+        export_schema(&schema, schema_mem.as_mut_ptr() as usize).unwrap();
+
+        // The schema declares one field but no array structs are supplied. The import must
+        // return a typed error (never unwind across the FFI boundary) and consume the schema.
+        let err = import_batch(schema_mem.as_ptr() as usize, &[], false).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::ArrowBridge);
+    }
 }

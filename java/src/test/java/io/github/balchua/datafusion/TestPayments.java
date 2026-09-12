@@ -1,7 +1,6 @@
 package io.github.balchua.datafusion;
 
 import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.DateDayVector;
 import org.apache.arrow.vector.DecimalVector;
 import org.apache.arrow.vector.IntVector;
@@ -11,7 +10,6 @@ import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.complex.ListVector;
 import org.apache.arrow.vector.complex.StructVector;
 import org.apache.arrow.vector.holders.TimeStampMilliHolder;
-import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
@@ -54,11 +52,6 @@ public final class TestPayments {
     // unbounded repeats as JSON arrays). Deterministic per row.
     // ------------------------------------------------------------------
 
-    private static String amt(String ccy, String value) {
-        return "{\"@ccy\":\"" + ccy + "\",\"#text\":" + value + "}";
-    }
-
-    /** RgltryRptg[1..n] -> DbtCdtRptgInd?, Athrty?, Dtls[1..n]{Tp?, Cd?, Amt?, Inf{DbtrSts?, CdtrSts?}, CdtrTx?, DbtrTx?, Taxonomies?} */
     /**
      * RgltryRptg[1..n] rendered as faithful JSON of the XML tree:
      * DbtCdtRptgInd?, Athrty?{Nm, PstlAdr{Ctry, AdrLine[1..n], TwnNm}, Othr?{Id, SchmeNm{Cd}}},

@@ -1,7 +1,6 @@
 package io.github.balchua.datafusion.bench;
 
 import io.github.balchua.datafusion.engine.EngineConfig;
-import io.github.balchua.datafusion.engine.EngineConfig.Builder;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -47,7 +46,7 @@ public final class BenchmarkMain {
                 org.apache.arrow.memory.RootAllocator allocator = new org.apache.arrow.memory.RootAllocator(
                         Long.MAX_VALUE)) {
             BenchmarkRunner runner = new BenchmarkRunner(
-                    allocator, p.engineConfig(), monitor, p.s3Bucket);
+                    allocator, p.engineConfig(), monitor);
 
             // ---------- PHASE 1: LOAD ----------
             var shape = p.shape();
@@ -58,7 +57,8 @@ public final class BenchmarkMain {
             BenchmarkRunner.LoadedDataset dataset = runner.load(shape, p.profile);
             printLoad(dataset.result());
 
-            // Optional: export the loaded tables so external tools (e.g. DuckDB) can inspect
+            // Optional: export the loaded tables so external tools (e.g. DuckDB) can
+            // inspect
             // exactly the data that was handed to DataFusion.
             if (p.dumpParquet != null) {
                 dumpTables(dataset, p.dumpParquet);
@@ -87,8 +87,11 @@ public final class BenchmarkMain {
     }
 
     /**
-     * Exports each loaded table to Parquet via Rust (queryToParquet). `dest` is a local
-     * directory, or an s3:// prefix. Files are named {@code <table>.parquet}.
+     * Exports each loaded table to Parquet via Rust (queryToParquet). `dest` is a
+     * local
+     * directory, or an s3:// prefix. Files are named {@code 
+     * <table>
+     * .parquet}.
      */
     private static void dumpTables(BenchmarkRunner.LoadedDataset dataset, String dest) throws Exception {
         boolean url = dest.contains("://");
@@ -97,7 +100,7 @@ public final class BenchmarkMain {
         }
         String base = dest.endsWith("/") ? dest.substring(0, dest.length() - 1) : dest;
         System.out.println("== DUMP (Parquet) ==");
-        for (String table : new String[] {"payment_message", "remittances", "transactions"}) {
+        for (String table : new String[] { "payment_message", "remittances", "transactions" }) {
             String target = base + "/" + table + ".parquet";
             long start = System.nanoTime();
             dataset.engine().queryToParquet("SELECT * FROM " + table, target);
@@ -142,7 +145,7 @@ public final class BenchmarkMain {
         Path scratchDir = Path.of(System.getProperty("java.io.tmpdir"), "dfe-scratch");
         long memoryLimitBytes = 0;
         boolean zeroCopy = true; // zero-copy is the default
-        String dumpParquet;      // optional: export loaded tables to Parquet for inspection
+        String dumpParquet; // optional: export loaded tables to Parquet for inspection
         String s3Bucket;
         String s3Endpoint;
         String s3Region;

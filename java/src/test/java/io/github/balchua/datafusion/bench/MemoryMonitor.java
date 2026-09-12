@@ -1,15 +1,20 @@
 package io.github.balchua.datafusion.bench;
 
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.LockSupport;
 
 /**
- * Samples process memory while the benchmark runs. Peak RSS is reported from the
- * kernel high-water mark ({@code /proc/self/status VmHWM}), which covers JVM, Java
- * Arrow buffers, JNI, Rust/DataFusion allocations and object-store clients — everything
- * in the process (see docs/memory.md). Java heap is sampled from {@link Runtime}.
+ * Samples process memory while the benchmark runs. Peak RSS is reported from
+ * the
+ * kernel high-water mark ({@code /proc/self/status VmHWM}), which covers JVM,
+ * Java
+ * Arrow buffers, JNI, Rust/DataFusion allocations and object-store clients —
+ * everything
+ * in the process (see docs/memory.md). Java heap is sampled from
+ * {@link Runtime}.
  */
 public final class MemoryMonitor implements AutoCloseable {
     private final Thread sampler;
@@ -22,12 +27,7 @@ public final class MemoryMonitor implements AutoCloseable {
                 if (heap > sampledPeakHeap) {
                     sampledPeakHeap = heap;
                 }
-                try {
-                    Thread.sleep(intervalMs);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return;
-                }
+                LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(intervalMs));
             }
         }, "dfe-memory-monitor");
         sampler.setDaemon(true);
@@ -60,7 +60,8 @@ public final class MemoryMonitor implements AutoCloseable {
                     return Long.parseLong(num);
                 }
             }
-        } catch (IOException | NumberFormatException ignored) {
+        } catch (IOException | NumberFormatException e) {
+            return 0; // /proc not readable or the value is not numeric
         }
         return 0;
     }

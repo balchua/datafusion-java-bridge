@@ -137,6 +137,7 @@ pub extern "system" fn Java_io_github_balchua_datafusion_engine_NativeEngine_eng
     // before freeing the Box.
     let engine = unsafe { &*(ptr as *const Engine) };
     engine.cancel_all_queries();
+    engine.cancel_all_operations();
     if engine.wait_idle() {
         unsafe { drop(Box::from_raw(ptr as *mut Engine)) };
     } else {
@@ -412,6 +413,9 @@ pub extern "system" fn Java_io_github_balchua_datafusion_engine_NativeEngine_res
 ) {
     let (_guard, engine) = match engine_from(handle) {
         Ok(pair) => pair,
+        // Closing a result after its engine was closed is a valid teardown order: the
+        // engine already drained the query, so this is a no-op rather than an error.
+        Err(e) if e.kind == ErrorKind::EngineClosed => return,
         Err(e) => {
             throw(&mut env, &e);
             return;

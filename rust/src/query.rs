@@ -75,10 +75,9 @@ impl QueryHandle {
                 }
             }
             if let Some(inner) = weak.upgrade() {
-                inner.produce_nanos.store(
-                    started.elapsed().as_nanos() as u64,
-                    Ordering::Release,
-                );
+                inner
+                    .produce_nanos
+                    .store(started.elapsed().as_nanos() as u64, Ordering::Release);
                 inner.finished.store(true, Ordering::Release);
             }
             drop(tx); // close the channel -> Java sees end-of-stream
@@ -95,7 +94,7 @@ impl QueryHandle {
             Some(Ok(batch)) => Ok(Some(batch)),
             Some(Err(e)) => {
                 // Drain remaining items so the producer never blocks on a dead consumer.
-                while let Ok(_) = rx.try_recv() {}
+                while rx.try_recv().is_ok() {}
                 Err(e)
             }
             None => {

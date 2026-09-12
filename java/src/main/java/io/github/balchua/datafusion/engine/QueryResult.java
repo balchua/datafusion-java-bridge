@@ -44,7 +44,7 @@ import io.github.balchua.datafusion.exception.QueryCancelledException;
 public final class QueryResult implements AutoCloseable {
     private final DataFusionEngine engine;
     private final long queryId;
-    private final RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+    private final RootAllocator allocator;
     private final Schema schema;
     private final List<Field> fields;
     private final CDataDictionaryProvider dictionaryProvider = new CDataDictionaryProvider();
@@ -54,21 +54,21 @@ public final class QueryResult implements AutoCloseable {
     QueryResult(DataFusionEngine engine, long queryId) {
         this.engine = engine;
         this.queryId = queryId;
+        RootAllocator newAllocator = new RootAllocator(Long.MAX_VALUE);
+        Schema imported;
         // Import the result schema once, then reuse the Java Schema for every batch.
-        try (ArrowSchema schemaStruct = ArrowSchema.allocateNew(allocator)) {
+        try (ArrowSchema schemaStruct = ArrowSchema.allocateNew(newAllocator)) {
             NativeEngine.resultSchema(engine.nativeHandle(), queryId, schemaStruct.memoryAddress());
-            this.schema = Data.importSchema(allocator, schemaStruct, dictionaryProvider);
-        } catch (RuntimeException | Error e) {
+            imported = Data.importSchema(newAllocator, schemaStruct, dictionaryProvider);
+        } catch (RuntimeException e) {
             // Constructor failure means the caller never gets a reference to close();
-            // free the allocator here. The native query is released by the caller.
-            try {
-                allocator.close();
-            } catch (RuntimeException closeFailure) {
-                e.addSuppressed(closeFailure);
-            }
+            // free the allocator here.
+            newAllocator.close();
             throw e;
         }
-        this.fields = schema.getFields();
+        this.allocator = newAllocator;
+        this.schema = imported;
+        this.fields = imported.getFields();
     }
 
     /** The result schema (same for every batch). */
@@ -89,6 +89,7 @@ public final class QueryResult implements AutoCloseable {
      * @throws QueryCancelledException if the query was cancelled
      * @throws DataFusionException     for any execution error
      */
+    @SuppressWarnings("java:S2093")
     public VectorSchemaRoot next() {
         if (closed) {
             throw new EngineClosedException("QueryResult is closed");
@@ -144,16 +145,11 @@ public final class QueryResult implements AutoCloseable {
     public void close() {
         if (!closed) {
             closed = true;
-            try {
-                NativeEngine.resultClose(engine.nativeHandle(), queryId);
-            } catch (EngineClosedException e) {
-                // The engine was closed and already drained/cancelled this query;
-                // closing the result afterwards is a valid teardown order.
-            } finally {
-                // Any imported vectors not closed by the caller are closed here via the
-                // allocator; the allocator itself must be free of children now.
-                allocator.close();
-            }
+            // Idempotent in native: after engine.close() this is a no-op.
+            NativeEngine.resultClose(engine.nativeHandle(), queryId);
+            // Any imported vectors not closed by the caller are closed here via the
+            // allocator; the allocator itself must be free of children now.
+            allocator.close();
         }
     }
 }

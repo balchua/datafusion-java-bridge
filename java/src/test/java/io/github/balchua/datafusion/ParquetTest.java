@@ -96,8 +96,9 @@ class ParquetTest {
     @Test
     void importMissingFileThrowsParquetError() {
         try (DataFusionEngine engine = new DataFusionEngine(EngineConfig.defaults())) {
+            String location = tempDir.resolve("does_not_exist.parquet").toString();
             DataFusionException e = assertThrows(DataFusionException.class,
-                    () -> engine.registerParquet("missing", tempDir.resolve("does_not_exist.parquet").toString()));
+                    () -> engine.registerParquet("missing", location));
             // Registration performs schema inference on the file and fails there.
             assertInstanceOf(ParquetException.class, e);
         }

@@ -11,7 +11,8 @@ import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.junit.jupiter.api.Test;
 
-import static org.junit.jupiter.api.Assertions.assertThrows;
+import java.util.concurrent.locks.LockSupport;
+
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Cancellation: aborting a long-running query from another thread (spec §28). */
@@ -34,13 +35,9 @@ class CancelTest {
                     "SELECT COUNT(*) AS n FROM transactions a, transactions b "
                             + "WHERE a.amount + b.amount > 0");
 
-            long started = System.nanoTime();
             Thread canceller = new Thread(() -> {
-                try {
-                    Thread.sleep(300);
-                    result.cancel();
-                } catch (Exception ignored) {
-                }
+                LockSupport.parkNanos(300_000_000L); // let the query start before cancelling
+                result.cancel();
             });
             canceller.start();
 

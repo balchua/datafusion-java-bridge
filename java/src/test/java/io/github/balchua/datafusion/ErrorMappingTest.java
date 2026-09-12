@@ -2,18 +2,13 @@ package io.github.balchua.datafusion;
 
 import io.github.balchua.datafusion.engine.DataFusionEngine;
 import io.github.balchua.datafusion.engine.EngineConfig;
-import io.github.balchua.datafusion.engine.QueryResult;
 
-import io.github.balchua.datafusion.exception.ArrowBridgeException;
 import io.github.balchua.datafusion.exception.DataFusionException;
 import io.github.balchua.datafusion.exception.EngineClosedException;
 import io.github.balchua.datafusion.exception.SqlParseException;
 import io.github.balchua.datafusion.exception.SqlUnsupportedException;
 import io.github.balchua.datafusion.exception.TableNotFoundException;
 import io.github.balchua.datafusion.engine.NativeEngine;
-import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.memory.RootAllocator;
-import org.apache.arrow.vector.VectorSchemaRoot;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
@@ -60,8 +55,10 @@ class ErrorMappingTest {
     @Test
     void unknownQueryIdThrowsEngineClosed() {
         try (DataFusionEngine engine = new DataFusionEngine(EngineConfig.defaults())) {
+            long handle = engine.nativeHandle();
+            long[] arrayAddrs = new long[0];
             DataFusionException e = assertThrows(DataFusionException.class,
-                    () -> NativeEngine.resultNextBatch(engine.nativeHandle(), 999_999L, new long[0]));
+                    () -> NativeEngine.resultNextBatch(handle, 999_999L, arrayAddrs));
             assertInstanceOf(EngineClosedException.class, e);
             assertTrue(e.getMessage().contains("not registered"));
         }

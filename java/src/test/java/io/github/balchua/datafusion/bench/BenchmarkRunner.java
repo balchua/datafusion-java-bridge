@@ -11,7 +11,6 @@ import org.apache.arrow.vector.complex.StructVector;
 
 import java.nio.file.Path;
 import java.time.Instant;
-import java.util.LinkedHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -19,17 +18,24 @@ import java.util.regex.Pattern;
  * Two-phase benchmark (spec §22/§25/§30), restructured for clarity:
  *
  * <ol>
- *   <li><b>LOAD</b> — generate the Arrow dataset in Java, bridge it into DataFusion,
- *       measure load time and memory (DataFusion accounting + RSS delta).</li>
- *   <li><b>QUERY</b> — run each SQL shape against the already-loaded tables and measure
- *       plan / execute / result-transfer separately. Every row carries the full SQL.</li>
+ * <li><b>LOAD</b> — generate the Arrow dataset in Java, bridge it into
+ * DataFusion,
+ * measure load time and memory (DataFusion accounting + RSS delta).</li>
+ * <li><b>QUERY</b> — run each SQL shape against the already-loaded tables and
+ * measure
+ * plan / execute / result-transfer separately. Every row carries the full
+ * SQL.</li>
  * </ol>
  *
- * Console output mirrors this with plain-language stage names and the SQL itself.
+ * Console output mirrors this with plain-language stage names and the SQL
+ * itself.
  */
 public final class BenchmarkRunner {
 
-    /** One dataset load: its shape, Arrow build time, load time and memory footprint. */
+    /**
+     * One dataset load: its shape, Arrow build time, load time and memory
+     * footprint.
+     */
     public record LoadResult(
             SyntheticPaymentGenerator.Shape shape,
             String profile,
@@ -47,7 +53,9 @@ public final class BenchmarkRunner {
             long rssAfterBytes,
             long peakRssBytes,
             long javaHeapBytes,
-            String[] versions) {}
+            String[] versions,
+            String timestamp) {
+    }
 
     /** One SQL execution against a loaded dataset. */
     public record QueryResultRow(
@@ -68,22 +76,21 @@ public final class BenchmarkRunner {
             long executeMs,
             long resultTransferMs,
             long peakRssBytes,
-            long javaHeapBytes) {}
+            long javaHeapBytes) {
+    }
 
     private static final Pattern PRODUCE_NANOS = Pattern.compile("\"produceNanos\":(\\d+)");
     private static final Pattern EXPORT_NANOS = Pattern.compile("\"(\\w+)_nanos\":(\\d+)");
 
     private final BufferAllocator allocator;
     private final EngineConfig config;
-        private final MemoryMonitor memoryMonitor;
-    private final String s3Bucket;
+    private final MemoryMonitor memoryMonitor;
 
     public BenchmarkRunner(BufferAllocator allocator, EngineConfig config,
-                           MemoryMonitor memory, String s3Bucket) {
+            MemoryMonitor memory) {
         this.allocator = allocator;
         this.config = config;
         this.memoryMonitor = memory;
-        this.s3Bucket = s3Bucket;
     }
 
     // ------------------------------------------------------------------
@@ -91,28 +98,31 @@ public final class BenchmarkRunner {
     // ------------------------------------------------------------------
 
     /**
-     * Generates the dataset and loads it into DataFusion. Returns load timings and the
+     * Generates the dataset and loads it into DataFusion. Returns load timings and
+     * the
      * memory delta; the engine is NOT closed (phase 2 reuses the loaded tables).
      */
     public LoadedDataset load(SyntheticPaymentGenerator.Shape shape, String profile) {
+        String loadTimestamp = Instant.now().toString();
         long rssBefore = memoryMonitor.currentRssBytes();
 
-        // One number for building the complete Arrow dataset (all columns, JSON, nested).
+        // One number for building the complete Arrow dataset (all columns, JSON,
+        // nested).
         long buildStart = System.nanoTime();
-        SyntheticPaymentGenerator.Generated g =
-                SyntheticPaymentGenerator.generate(shape, profile, allocator);
+        SyntheticPaymentGenerator.Generated g = SyntheticPaymentGenerator.generate(shape, profile, allocator);
         long arrowBuildNanos = System.nanoTime() - buildStart;
         long arrowBytes = measureArrowBytes(g);
         // Actual Java off-heap Arrow allocation (includes vector growth slack), sampled
         // while all roots are still open.
         long arrowAllocatedBytes = allocator.getAllocatedMemory();
 
-        // One number for moving it into DataFusion (JNI + Rust deep copy + registration).
+        // One number for moving it into DataFusion (JNI + Rust deep copy +
+        // registration).
         long loadStart = System.nanoTime();
         DataFusionEngine engine = new DataFusionEngine(config);
         try (VectorSchemaRoot m = g.message();
-             VectorSchemaRoot r = g.remittances();
-             VectorSchemaRoot txn = g.transactions()) {
+                VectorSchemaRoot r = g.remittances();
+                VectorSchemaRoot txn = g.transactions()) {
             engine.registerArrow("payment_message", m);
             engine.registerArrow("remittances", r);
             engine.registerArrow("transactions", txn);
@@ -126,7 +136,7 @@ public final class BenchmarkRunner {
                 arrowBuildNanos, loadIntoDatafusionNanos, arrowBytes, arrowAllocatedBytes,
                 config.zeroCopy(),
                 rssBefore, rssAfter, memoryMonitor.peakRssBytes(),
-                memoryMonitor.peakJavaHeapBytes(), null));
+                memoryMonitor.peakJavaHeapBytes(), null, loadTimestamp));
     }
 
     /** A loaded dataset: the live engine plus the LOAD measurement. */
@@ -136,7 +146,10 @@ public final class BenchmarkRunner {
         }
     }
 
-    /** Arrow buffer bytes of the transactions batch, recursing into struct/list children. */
+    /**
+     * Arrow buffer bytes of the transactions batch, recursing into struct/list
+     * children.
+     */
     private long measureArrowBytes(SyntheticPaymentGenerator.Generated g) {
         long bytes = 0;
         for (var vector : g.transactions().getFieldVectors()) {
@@ -147,7 +160,8 @@ public final class BenchmarkRunner {
 
     /**
      * Sums the buffer bytes of a vector and its nested children. StructVector's own
-     * getFieldBuffers() returns only its validity buffer, so children must be visited
+     * getFieldBuffers() returns only its validity buffer, so children must be
+     * visited
      * explicitly or the reported size is wildly understated.
      */
     private static long vectorBytes(FieldVector vector) {
@@ -211,7 +225,9 @@ public final class BenchmarkRunner {
     // Parquet helpers (scenarios B/C/E use them; kept from the previous design)
     // ------------------------------------------------------------------
 
-    /** Encodes a query result to Parquet in Rust; returns (encode_ms, publish_ms). */
+    /**
+     * Encodes a query result to Parquet in Rust; returns (encode_ms, publish_ms).
+     */
     public long[] exportToParquet(LoadedDataset dataset, BenchmarkQuery query, Path scratchDir) {
         String destination = scratchDir.resolve(
                 "bench_" + query.name + ".parquet").toString();
@@ -248,16 +264,19 @@ public final class BenchmarkRunner {
                 }
             }
         }
-        return new long[] {encode / 1_000_000L, publish / 1_000_000L};
+        return new long[] { encode / 1_000_000L, publish / 1_000_000L };
     }
 
     private static String[] parseVersions(String info) {
         String rust = "unknown", df = "unknown", arrow = "unknown";
         for (String part : info.split(" ")) {
-            if (part.startsWith("rust=")) rust = part.substring("rust=".length());
-            if (part.startsWith("datafusion=")) df = part.substring("datafusion=".length());
-            if (part.startsWith("arrow=")) arrow = part.substring("arrow=".length());
+            if (part.startsWith("rust="))
+                rust = part.substring("rust=".length());
+            if (part.startsWith("datafusion="))
+                df = part.substring("datafusion=".length());
+            if (part.startsWith("arrow="))
+                arrow = part.substring("arrow=".length());
         }
-        return new String[] {rust, df, arrow};
+        return new String[] { rust, df, arrow };
     }
 }

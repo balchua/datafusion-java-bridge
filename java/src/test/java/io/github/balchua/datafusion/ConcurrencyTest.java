@@ -1,35 +1,36 @@
 package io.github.balchua.datafusion;
 
-import io.github.balchua.datafusion.engine.DataFusionEngine;
-import io.github.balchua.datafusion.engine.EngineConfig;
-import io.github.balchua.datafusion.engine.QueryResult;
-
-import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.memory.RootAllocator;
-import org.apache.arrow.vector.VarCharVector;
-import org.apache.arrow.vector.VectorSchemaRoot;
-import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.junit.jupiter.api.Test;
 
-/** Concurrency: multiple concurrent queries over one shared engine (spec §13/§29). */
+import io.github.balchua.datafusion.engine.DataFusionEngine;
+import io.github.balchua.datafusion.engine.EngineConfig;
+import io.github.balchua.datafusion.engine.QueryResult;
+
+/**
+ * Concurrency: multiple concurrent queries over one shared engine (spec
+ * §13/§29).
+ */
 class ConcurrencyTest {
 
     @Test
     void concurrentQueriesOnSharedEngine() throws Exception {
         BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
         try (DataFusionEngine engine = new DataFusionEngine(EngineConfig.defaults());
-             VectorSchemaRoot message = TestPayments.messageRoot("MSG-1", 500, allocator);
-             VectorSchemaRoot remittances = TestPayments.remittancesRoot("MSG-1", 20, allocator);
-             VectorSchemaRoot transactions = TestPayments.transactionsRoot("MSG-1", 500, allocator)) {
+                VectorSchemaRoot message = TestPayments.messageRoot("MSG-1", 500, allocator);
+                VectorSchemaRoot remittances = TestPayments.remittancesRoot("MSG-1", 20, allocator);
+                VectorSchemaRoot transactions = TestPayments.transactionsRoot("MSG-1", 500, allocator)) {
             engine.registerArrow(PaymentSchemas.TABLE_MESSAGE, message);
             engine.registerArrow(PaymentSchemas.TABLE_REMITTANCES, remittances);
             engine.registerArrow(PaymentSchemas.TABLE_TRANSACTIONS, transactions);

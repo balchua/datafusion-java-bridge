@@ -1,6 +1,9 @@
 package io.github.balchua.datafusion.bench;
 
-import io.github.balchua.datafusion.TestPayments;
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.util.ArrayList;
+import java.util.List;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.BigIntVector;
@@ -9,44 +12,59 @@ import org.apache.arrow.vector.DecimalVector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.TimeStampMilliVector;
 import org.apache.arrow.vector.VarCharVector;
-import org.apache.arrow.vector.holders.TimeStampMilliHolder;
 import org.apache.arrow.vector.VectorSchemaRoot;
-import org.apache.arrow.vector.complex.ListVector;
 import org.apache.arrow.vector.complex.StructVector;
+import org.apache.arrow.vector.holders.TimeStampMilliHolder;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 
-import java.math.BigDecimal;
-import java.math.RoundingMode;
-import java.util.ArrayList;
-import java.util.List;
-
 /**
- * Synthetic benchmark data generator (spec §18). Generates the canonical payment tables
- * **directly into Arrow vectors** — no XML, no Java POJO graphs, deterministic content.
+ * Synthetic benchmark data generator (spec §18). Generates the canonical
+ * payment tables
+ * **directly into Arrow vectors** — no XML, no Java POJO graphs, deterministic
+ * content.
  *
- * <p>Stage separation (spec §22): {@code gen} computes column values into plain Java
- * arrays (this is where a production parser would decode XML), {@code build} writes them
+ * <p>
+ * Stage separation (spec §22): {@code gen} computes column values into plain
+ * Java
+ * arrays (this is where a production parser would decode XML), {@code build}
+ * writes them
  * into Arrow vectors, {@code batch} creates the VectorSchemaRoot (RecordBatch).
  *
- * <p>Profiles (spec §20): {@code normal} = canonical model + 6 structured extension
- * groups (~200 logical leaf fields); {@code wide} = 40 named domain groups (~2000 leaf
- * fields) resembling an expanded ISO 20022 structure. Extension leaves keep meaningful
- * nested names ({@code regulatory_reporting_g0.branch_3_counter}), not field0001.
+ * <p>
+ * Profiles (spec §20): {@code normal} = canonical model + 6 structured
+ * extension
+ * groups (~200 logical leaf fields); {@code wide} = 40 named domain groups
+ * (~2000 leaf
+ * fields) resembling an expanded ISO 20022 structure. Extension leaves keep
+ * meaningful
+ * nested names ({@code regulatory_reporting_g0.branch_3_counter}), not
+ * field0001.
  */
 public final class SyntheticPaymentGenerator {
 
-    public record SchemaStats(int topLevelColumns, int nestedStructFields, int leafFields) {}
+    public record SchemaStats(int topLevelColumns, int nestedStructFields, int leafFields) {
+    }
 
-    public record Timings(long genNanos, long buildNanos, long batchNanos) {}
+    public record Timings(long genNanos, long buildNanos, long batchNanos) {
+    }
 
-    /** Dataset shape: messages x remittances-per-message x transactions-per-remittance. */
+    /**
+     * Dataset shape: messages x remittances-per-message x
+     * transactions-per-remittance.
+     */
     public record Shape(int messages, int remittancesPerMessage, int transactionsPerRemittance) {
-        public int remittances() { return messages * remittancesPerMessage; }
-        public int transactions() { return (long) messages * remittancesPerMessage * transactionsPerRemittance > Integer.MAX_VALUE
-                ? Integer.MAX_VALUE : messages * remittancesPerMessage * transactionsPerRemittance; }
+        public int remittances() {
+            return messages * remittancesPerMessage;
+        }
+
+        public int transactions() {
+            return (long) messages * remittancesPerMessage * transactionsPerRemittance > Integer.MAX_VALUE
+                    ? Integer.MAX_VALUE
+                    : messages * remittancesPerMessage * transactionsPerRemittance;
+        }
     }
 
     public record Generated(
@@ -54,7 +72,8 @@ public final class SyntheticPaymentGenerator {
             VectorSchemaRoot remittances,
             VectorSchemaRoot transactions,
             Timings timings,
-            SchemaStats transactionsStats) {}
+            SchemaStats transactionsStats) {
+    }
 
     public static final String MESSAGE_ID = "MSG-SYNTH-1";
     public static final String MATCH_DEBTOR = "BBB";
@@ -74,10 +93,11 @@ public final class SyntheticPaymentGenerator {
             "pension_reference"
     };
 
-    private static final String[] CURRENCIES = {"EUR", "USD", "GBP", "CHF"};
-    private static final String[] STATUSES = {"ACSC", "PDNG", "RJCT"};
+    private static final String[] CURRENCIES = { "EUR", "USD", "GBP", "CHF" };
+    private static final String[] STATUSES = { "ACSC", "PDNG", "RJCT" };
 
-    private SyntheticPaymentGenerator() {}
+    private SyntheticPaymentGenerator() {
+    }
 
     /** debtor name cycles such that 'BBB' matches every 26th row offset by 1. */
     public static String partyName(int r) {
@@ -111,7 +131,10 @@ public final class SyntheticPaymentGenerator {
         return io.github.balchua.datafusion.PaymentSchemas.transactionSchema().getFields();
     }
 
-    /** {@code name: Struct{name_block: Struct{leaf...}}} with alternating leaf types. */
+    /**
+     * {@code name: Struct{name_block: Struct{leaf...}}} with alternating leaf
+     * types.
+     */
     static Field extensionGroup(String name, int leaves) {
         List<Field> inner = new ArrayList<>();
         for (int f = 0; f < leaves; f++) {
@@ -135,7 +158,10 @@ public final class SyntheticPaymentGenerator {
         };
     }
 
-    /** Logical field counting: top-level columns, nested struct fields, leaves (spec §20). */
+    /**
+     * Logical field counting: top-level columns, nested struct fields, leaves (spec
+     * §20).
+     */
     public static SchemaStats stats(Schema schema) {
         int[] counters = new int[3]; // top-level, nested struct fields, leaves
         for (Field f : schema.getFields()) {
@@ -165,7 +191,10 @@ public final class SyntheticPaymentGenerator {
         return generate(new Shape(1, (rows + 24) / 25, 25), profile, allocator);
     }
 
-    /** Full generation for a hierarchical shape: messages x remittances x transactions. */
+    /**
+     * Full generation for a hierarchical shape: messages x remittances x
+     * transactions.
+     */
     public static Generated generate(Shape shape, String profile, BufferAllocator allocator) {
         if (NarrowPain001.PROFILE.equals(profile)) {
             return generateNarrow(shape, allocator);
@@ -205,7 +234,7 @@ public final class SyntheticPaymentGenerator {
         // ---------- batch: finalize the roots ----------
         long batchStart = System.nanoTime();
         transactions.setRowCount(rows);
-        VectorSchemaRoot messageRoot = buildMessageRoot(shape, rows, allocator);
+        VectorSchemaRoot messageRoot = buildMessageRoot(shape, allocator);
         VectorSchemaRoot remittanceRoot = buildRemittanceRoot(shape, rows, allocator);
         long batchEnd = System.nanoTime();
 
@@ -215,7 +244,8 @@ public final class SyntheticPaymentGenerator {
     }
 
     /**
-     * Narrow profile: flat pain.001-like schema matching the java-arrow-pain benchmark
+     * Narrow profile: flat pain.001-like schema matching the java-arrow-pain
+     * benchmark
      * (36 flat columns, no Struct/List/JSON). Used only for ingestion comparisons.
      */
     private static Generated generateNarrow(Shape shape, BufferAllocator allocator) {
@@ -228,83 +258,14 @@ public final class SyntheticPaymentGenerator {
                 new Timings(0L, buildNanos, 0L), stats(transactions.getSchema()));
     }
 
-    /** Writes all canonical transaction columns. */
-    private static void fillCanonical(VectorSchemaRoot root, int rows,
-                                      byte[][] txnIds, long[] amountCents,
-                                      int[] currencyIdx, int[] statusIdx, int[] dayOffsets,
-                                      byte[][] debtorIbans, Shape shape) {
-        VarCharVector txnId = (VarCharVector) root.getVector("transaction_id");
-        VarCharVector msgId = (VarCharVector) root.getVector("message_id");
-        VarCharVector remId = (VarCharVector) root.getVector("remittance_id");
-        VarCharVector e2e = (VarCharVector) root.getVector("end_to_end_id");
-        DecimalVector amount = (DecimalVector) root.getVector("amount");
-        VarCharVector currency = (VarCharVector) root.getVector("currency");
-        StructVector debtor = (StructVector) root.getVector("debtor");
-        VarCharVector debtorName = (VarCharVector) debtor.getChild("name");
-        StructVector debtorAccount = (StructVector) debtor.getChild("account");
-        VarCharVector debtorIban = (VarCharVector) debtorAccount.getChild("iban");
-        VarCharVector debtorNumber = (VarCharVector) debtorAccount.getChild("number");
-        VarCharVector debtorBic = (VarCharVector) debtor.getChild("agent_bic");
-        StructVector creditor = (StructVector) root.getVector("creditor");
-        VarCharVector creditorName = (VarCharVector) creditor.getChild("name");
-        StructVector creditorAccount = (StructVector) creditor.getChild("account");
-        VarCharVector creditorIban = (VarCharVector) creditorAccount.getChild("iban");
-        VarCharVector creditorNumber = (VarCharVector) creditorAccount.getChild("number");
-        VarCharVector creditorBic = (VarCharVector) creditor.getChild("agent_bic");
-        ListVector structured = (ListVector) root.getVector("structured_remittance");
-        StructVector items = (StructVector) structured.getDataVector();
-        VarCharVector code = (VarCharVector) items.getChild("code");
-        VarCharVector reference = (VarCharVector) items.getChild("reference");
-        DecimalVector itemAmount = (DecimalVector) items.getChild("amount");
-        VarCharVector remitInfo = (VarCharVector) root.getVector("remittance_information");
-        DateDayVector date = (DateDayVector) root.getVector("requested_execution_date");
-        VarCharVector status = (VarCharVector) root.getVector("transaction_status");
-
-        for (int r = 0; r < rows; r++) {
-            int remittance = r / shape.transactionsPerRemittance();
-            txnId.setSafe(r, txnIds[r]);
-            remId.setSafe(r, ("RMT-" + remittance).getBytes());
-            msgId.setSafe(r, ("MSG-" + (remittance / shape.remittancesPerMessage())).getBytes());
-            e2e.setSafe(r, ("E2E-" + r).getBytes());
-            amount.setSafe(r, BigDecimal.valueOf(amountCents[r], 4).setScale(4, RoundingMode.UNNECESSARY));
-            currency.setSafe(r, CURRENCIES[currencyIdx[r]].getBytes());
-            debtor.setIndexDefined(r);
-            debtorAccount.setIndexDefined(r);
-            debtorName.setSafe(r, partyName(r).getBytes());
-            debtorIban.setSafe(r, debtorIbans[r]);
-            debtorNumber.setSafe(r, ("ACC" + r).getBytes());
-            debtorBic.setSafe(r, BIC_BYTES);
-            creditor.setIndexDefined(r);
-            creditorAccount.setIndexDefined(r);
-            creditorName.setSafe(r, partyName(r + 7).getBytes());
-            creditorIban.setSafe(r, ("GB" + (300000000 + r) + "0000000000").getBytes());
-            creditorNumber.setSafe(r, ("CR-" + r).getBytes());
-            creditorBic.setSafe(r, "DEUTDEFFXXX".getBytes());
-            int itemCount = 1 + (r % 3);
-            structured.startNewValue(r);
-            int base = structured.getOffsetBuffer().getInt((long) r * 4);
-            for (int i = 0; i < itemCount; i++) {
-                int idx = base + i;
-                items.setIndexDefined(idx);
-                code.setSafe(idx, "SCOR".getBytes());
-                reference.setSafe(idx, ("REF-" + r + "-" + i).getBytes());
-                itemAmount.setSafe(idx, BigDecimal.valueOf(10L * i + r % 7, 4).setScale(4, RoundingMode.UNNECESSARY));
-            }
-            structured.endValue(r, itemCount);
-            remitInfo.setSafe(r, ("INVOICE-" + remittance).getBytes());
-            date.setSafe(r, 20000 + dayOffsets[r]);
-            status.setSafe(r, STATUSES[statusIdx[r]].getBytes());
-        }
-    }
-
     /**
-     * Writes the synthetic extension groups of the transactions root. Only the 'wide'
+     * Writes the synthetic extension groups of the transactions root. Only the
+     * 'wide'
      * profile carries them; 'normal' is the real canonical model only.
      */
     private static void fillExtensions(VectorSchemaRoot root, String profile, int rows) {
         int groups = "wide".equals(profile) ? 40 : 6;
         int leaves = "wide".equals(profile) ? 48 : 22;
-        Schema schema = root.getSchema();
         for (int g = 0; g < groups; g++) {
             String groupName = DOMAIN_PREFIXES[g % DOMAIN_PREFIXES.length] + "_g" + g;
             StructVector group = (StructVector) root.getVector(groupName);
@@ -352,10 +313,8 @@ public final class SyntheticPaymentGenerator {
         }
     }
 
-    private static final byte[] BIC_BYTES = "COBADEFFXXX".getBytes();
-
     /** Message root: one row per message. */
-    public static VectorSchemaRoot buildMessageRoot(Shape shape, int transactionRows, BufferAllocator allocator) {
+    public static VectorSchemaRoot buildMessageRoot(Shape shape, BufferAllocator allocator) {
         VectorSchemaRoot root = VectorSchemaRoot.create(
                 io.github.balchua.datafusion.PaymentSchemas.messageSchema(), allocator);
         VarCharVector id = (VarCharVector) root.getVector("message_id");

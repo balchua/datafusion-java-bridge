@@ -9,6 +9,7 @@ use datafusion::prelude::ParquetReadOptions;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::arrow_bridge;
@@ -49,6 +50,10 @@ pub struct EngineConfig {
     /// into Rust-owned memory, so Java may free/reuse them immediately.
     #[serde(default = "default_true")]
     pub zero_copy: bool,
+    /// How long `engineClose` waits for in-flight native calls to return before giving up
+    /// and leaking the engine instead of freeing it. Milliseconds. Absent = 60_000.
+    /// `0` = wait forever (never leak, but a hung call can block close indefinitely).
+    pub close_timeout_millis: Option<u64>,
 }
 
 pub struct Engine {
@@ -59,6 +64,11 @@ pub struct Engine {
     queries: Mutex<HashMap<u64, Arc<QueryHandle>>>,
     object_stores: Mutex<ObjectStoreRegistry>,
     next_id: AtomicU64,
+    /// `None` = wait forever for in-flight calls; `Some` = give up and leak after this long.
+    close_timeout: Option<std::time::Duration>,
+    /// Cancels non-query operations (`queryToParquet`, `registerParquet`) that run
+    /// synchronously on a JNI thread. Tripped by `engineClose` before it waits idle.
+    shutdown: CancellationToken,
     /// Number of native calls currently inside this engine. `engineClose` waits for
     /// this to reach 0 after cancelling queries, so an in-flight `result_next` on a
     /// foreign thread can never touch a freed engine.
@@ -97,6 +107,11 @@ fn select_only_options() -> SQLOptions {
         .with_allow_statements(false)
 }
 
+/// Error returned when an operation is cancelled because the engine is shutting down.
+fn shutdown_error() -> EngineError {
+    EngineError::new(ErrorKind::EngineClosed, "engine is closing")
+}
+
 impl Engine {
     /// Builds a version string for benchmark metadata.
     pub fn version() -> String {
@@ -116,19 +131,30 @@ impl Engine {
         }
     }
 
-    /// Blocks until all in-flight native calls returned, or the deadline expires.
-    /// Returns `true` if the engine is idle (safe to free), `false` if a call is still
-    /// running (the caller must NOT free the engine — leaking is safer than a UAF).
+    /// Cancels non-query operations (`queryToParquet`, `registerParquet`) currently running
+    /// on a JNI thread. Called by `engineClose` before it waits for `active_calls` to drain.
+    /// Each operation races the token via `tokio::select!`, so cancellation drops the
+    /// in-flight future (closing any connection) instead of waiting on the network.
+    pub fn cancel_all_operations(&self) {
+        self.shutdown.cancel();
+    }
+
+    /// Blocks until all in-flight native calls returned, or the configured deadline
+    /// expires. Returns `true` if the engine is idle (safe to free), `false` if a call is
+    /// still running (the caller must NOT free the engine — leaking is safer than a UAF).
     ///
     /// Called with the handle already removed from the registry, so no new calls can
-    /// enter and `active_calls` cannot increase.
+    /// enter and `active_calls` cannot increase. The deadline comes from
+    /// `EngineConfig::close_timeout_millis` (default 60 s; `None` waits forever).
     pub fn wait_idle(&self) -> bool {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let deadline = self.close_timeout.map(|d| std::time::Instant::now() + d);
         while self.active_calls.load(Ordering::SeqCst) > 0 {
-            if std::time::Instant::now() > deadline {
-                // Do not block forever on a stuck call; the caller will leak the engine
-                // rather than drop it, avoiding a use-after-free in that call.
-                return false;
+            if let Some(dl) = deadline {
+                if std::time::Instant::now() > dl {
+                    // Do not block forever on a stuck call; the caller will leak the engine
+                    // rather than drop it, avoiding a use-after-free in that call.
+                    return false;
+                }
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
@@ -175,6 +201,11 @@ impl Engine {
 
         let ctx = SessionContext::new_with_config_rt(session_config, runtime_env);
         let s3 = config.s3.clone();
+        let close_timeout = match config.close_timeout_millis {
+            Some(0) => None, // 0 = wait forever for in-flight calls
+            Some(ms) => Some(std::time::Duration::from_millis(ms)),
+            None => Some(std::time::Duration::from_secs(60)),
+        };
 
         Ok(Engine {
             config,
@@ -184,6 +215,8 @@ impl Engine {
             queries: Mutex::new(HashMap::new()),
             object_stores: Mutex::new(ObjectStoreRegistry::new(s3)),
             next_id: AtomicU64::new(1),
+            close_timeout,
+            shutdown: CancellationToken::new(),
             active_calls: AtomicU64::new(0),
         })
     }
@@ -231,11 +264,15 @@ impl Engine {
     /// Registers a Parquet-backed table. Parquet decoding stays entirely in DataFusion.
     pub fn register_parquet(&self, table: &str, location: &str) -> Result<()> {
         self.ensure_object_store(location)?;
+        let cancel = self.shutdown.clone();
         self.rt.block_on(async {
-            self.ctx
-                .register_parquet(table, location, ParquetReadOptions::default())
-                .await
-                .map_err(Into::into)
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err(shutdown_error()),
+                r = self.ctx.register_parquet(table, location, ParquetReadOptions::default()) => {
+                    r.map_err(Into::into)
+                }
+            }
         })
     }
 
@@ -279,22 +316,23 @@ impl Engine {
     /// starts execution on the runtime. Returns the query id.
     pub fn query(&self, sql: &str) -> Result<u64> {
         sql_guard::validate_select_only(sql)?;
-        let (schema, plan) = self.plan(sql)?;
+        let (schema, plan) = self.rt.block_on(self.plan_async(sql))?;
         let qid = self.next_id.fetch_add(1, Ordering::SeqCst);
         let handle = QueryHandle::start(self.rt.handle(), schema, plan, self.ctx.state().task_ctx());
         self.queries.lock().unwrap().insert(qid, handle);
         Ok(qid)
     }
 
-    /// Blocking planning phase. Returns (result schema, physical plan).
-    fn plan(&self, sql: &str) -> Result<(SchemaRef, Arc<dyn datafusion::physical_plan::ExecutionPlan>)> {
-        self.rt.block_on(async {
-            let state = self.ctx.state();
-            let logical = state.create_logical_plan(sql).await?;
-            select_only_options().verify_plan(&logical)?;
-            let physical = state.create_physical_plan(&logical).await?;
-            Ok((physical.schema(), physical))
-        })
+    /// Planning phase. Returns (result schema, physical plan).
+    async fn plan_async(
+        &self,
+        sql: &str,
+    ) -> Result<(SchemaRef, Arc<dyn datafusion::physical_plan::ExecutionPlan>)> {
+        let state = self.ctx.state();
+        let logical = state.create_logical_plan(sql).await?;
+        select_only_options().verify_plan(&logical)?;
+        let physical = state.create_physical_plan(&logical).await?;
+        Ok((physical.schema(), physical))
     }
 
     pub fn result_schema(&self, qid: u64, out_schema_ptr: usize) -> Result<()> {
@@ -369,12 +407,19 @@ impl Engine {
     /// Returns (encode_nanos, publish_nanos) for benchmarking.
     pub fn query_to_parquet(&self, sql: &str, destination: &str) -> Result<(u64, u64)> {
         sql_guard::validate_select_only(sql)?;
-        let (schema, plan) = self.plan(sql)?;
-        // execute_stream spawns DataFusion runtime helpers internally, which requires a
-        // tokio runtime context: enter the runtime for the call.
-        let stream = self.rt.block_on(async {
-            datafusion::physical_plan::execute_stream(plan, self.ctx.state().task_ctx())
-        })?;
+        let cancel = self.shutdown.clone();
+        self.rt.block_on(async {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err(shutdown_error()),
+                r = self.query_to_parquet_inner(sql, destination) => r,
+            }
+        })
+    }
+
+    async fn query_to_parquet_inner(&self, sql: &str, destination: &str) -> Result<(u64, u64)> {
+        let (schema, plan) = self.plan_async(sql).await?;
+        let stream = datafusion::physical_plan::execute_stream(plan, self.ctx.state().task_ctx())?;
         let compression = parquet::compression_from_name(
             self.config.parquet_compression.as_deref().unwrap_or("snappy"),
         )?;
@@ -382,14 +427,16 @@ impl Engine {
             std::env::temp_dir().to_string_lossy().to_string()
         });
         let (scratch, encode_ns) = parquet::encode_to_scratch(
-            self.rt.handle(),
             schema,
             stream,
             std::path::Path::new(&scratch_dir),
             compression,
-        )?;
+            &self.shutdown,
+        )
+        .await?;
         let store = self.resolve_store(destination)?;
-        let publish_ns = parquet::publish(self.rt.handle(), &scratch, destination, store)?;
+        let publish_ns =
+            parquet::publish(scratch.path(), destination, store, &self.shutdown).await?;
         Ok((encode_ns, publish_ns))
     }
 }
@@ -400,6 +447,7 @@ impl Drop for Engine {
         for (_, handle) in self.queries.lock().unwrap().drain() {
             handle.cancel();
         }
+        self.shutdown.cancel();
         // Drop SessionContext -> MemTables (all registered batches) are released.
     }
 }

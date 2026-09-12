@@ -4,27 +4,28 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.time.Instant;
-import java.util.List;
 
 /**
- * Writes machine-readable benchmark output: one <code>.json</code> and one <code>.csv</code>
- * side by side (spec §30). Contains a LOAD section (dataset shape, load time, memory) and
+ * Writes machine-readable benchmark output: one <code>.json</code> and one
+ * <code>.csv</code>
+ * side by side (spec §30). Contains a LOAD section (dataset shape, load time,
+ * memory) and
  * a QUERY section (one self-describing row per SQL, with the SQL text itself).
  */
 public final class ResultsWriter {
-    private ResultsWriter() {}
+    private ResultsWriter() {
+    }
 
     public static void write(Path outputBase,
-                             BenchmarkRunner.LoadResult load,
-                             java.util.List<BenchmarkRunner.QueryResultRow> queries) throws IOException {
+            BenchmarkRunner.LoadResult load,
+            java.util.List<BenchmarkRunner.QueryResultRow> queries) throws IOException {
         writeJson(outputBase, load, queries);
         writeCsv(outputBase, load, queries);
     }
 
     private static void writeJson(Path outputBase,
-                                  BenchmarkRunner.LoadResult load,
-                                  java.util.List<BenchmarkRunner.QueryResultRow> queries) throws IOException {
+            BenchmarkRunner.LoadResult load,
+            java.util.List<BenchmarkRunner.QueryResultRow> queries) throws IOException {
         StringBuilder sb = new StringBuilder();
         sb.append("{\n");
         // versions from the first query row (or defaults if no queries ran)
@@ -58,16 +59,23 @@ public final class ResultsWriter {
                 .append(", \"transactions\": ").append(load.transactions()).append("},\n");
         sb.append("    \"transactions_top_level_columns\": ").append(load.transactionsTopLevelColumns()).append(",\n");
         sb.append("    \"transactions_leaf_fields\": ").append(load.transactionsLeafFields()).append(",\n");
-        sb.append("    \"arrow_build_ms\": ").append(String.format("%.1f", load.arrowBuildNanos() / 1_000_000.0)).append(",\n");
-        sb.append("    \"load_into_datafusion_ms\": ").append(String.format("%.1f", load.loadIntoDatafusionNanos() / 1_000_000.0)).append(",\n");
+        sb.append("    \"arrow_build_ms\": ").append(String.format("%.1f", load.arrowBuildNanos() / 1_000_000.0))
+                .append(",\n");
+        sb.append("    \"load_into_datafusion_ms\": ")
+                .append(String.format("%.1f", load.loadIntoDatafusionNanos() / 1_000_000.0)).append(",\n");
         sb.append("    \"ingest_mode\": \"").append(load.zeroCopy() ? "zero-copy" : "deep-copy").append("\",\n");
         sb.append("    \"arrow_data_bytes\": ").append(load.loadedArrowBytes()).append(",\n");
-        sb.append("    \"arrow_data_mb\": ").append(String.format("%.1f", load.loadedArrowBytes() / 1048576.0)).append(",\n");
-        sb.append("    \"arrow_allocated_mb\": ").append(String.format("%.1f", load.arrowAllocatedBytes() / 1048576.0)).append(",\n");
-        sb.append("    \"rss_before_mb\": ").append(String.format("%.0f", load.rssBeforeBytes() / 1048576.0)).append(",\n");
-        sb.append("    \"rss_after_mb\": ").append(String.format("%.0f", load.rssAfterBytes() / 1048576.0)).append(",\n");
+        sb.append("    \"arrow_data_mb\": ").append(String.format("%.1f", load.loadedArrowBytes() / 1048576.0))
+                .append(",\n");
+        sb.append("    \"arrow_allocated_mb\": ").append(String.format("%.1f", load.arrowAllocatedBytes() / 1048576.0))
+                .append(",\n");
+        sb.append("    \"rss_before_mb\": ").append(String.format("%.0f", load.rssBeforeBytes() / 1048576.0))
+                .append(",\n");
+        sb.append("    \"rss_after_mb\": ").append(String.format("%.0f", load.rssAfterBytes() / 1048576.0))
+                .append(",\n");
         sb.append("    \"peak_rss_mb\": ").append(String.format("%.0f", load.peakRssBytes() / 1048576.0)).append(",\n");
-        sb.append("    \"java_heap_mb\": ").append(String.format("%.0f", load.javaHeapBytes() / 1048576.0)).append("\n");
+        sb.append("    \"java_heap_mb\": ").append(String.format("%.0f", load.javaHeapBytes() / 1048576.0))
+                .append("\n");
         sb.append("  }");
         return sb.toString();
     }
@@ -91,14 +99,26 @@ public final class ResultsWriter {
         return sb.append("}").toString();
     }
 
+    /**
+     * A single rectangular table: the LOAD columns come first, then the query-only
+     * columns.
+     * LOAD rows leave the query columns empty; QUERY rows leave the load-only value
+     * columns
+     * empty. This keeps one header valid for every row (and preserves the original
+     * LOAD
+     * column positions).
+     */
+    private static final String CSV_HEADER = "phase,timestamp,java_version,rust_version,datafusion_version,arrow_version,"
+            + "messages,remittances_per_message,transactions_per_remittance,schema_profile,"
+            + "transactions,stage_name,stage_ms,value_name,value,peak_rss_mb,java_heap_mb,"
+            + "query_sql,result_rows,plan_ms,execute_ms,result_transfer_ms";
+
     private static void writeCsv(Path outputBase,
-                                 BenchmarkRunner.LoadResult load,
-                                 java.util.List<BenchmarkRunner.QueryResultRow> queries) throws IOException {
+            BenchmarkRunner.LoadResult load,
+            java.util.List<BenchmarkRunner.QueryResultRow> queries) throws IOException {
         StringBuilder sb = new StringBuilder();
+        sb.append(CSV_HEADER).append('\n');
         // -- LOAD rows (one per dataset) --
-        sb.append("phase,timestamp,java_version,rust_version,datafusion_version,arrow_version,");
-        sb.append("messages,remittances_per_message,transactions_per_remittance,schema_profile,");
-        sb.append("transactions,stage_name,stage_ms,value_name,value,peak_rss_mb,java_heap_mb\n");
         loadRow(sb, queries, load, "arrow_build",
                 load.arrowBuildNanos() / 1_000_000.0, null, null);
         loadRow(sb, queries, load, "load_into_datafusion",
@@ -115,55 +135,65 @@ public final class ResultsWriter {
                 load.rssAfterBytes() / 1048576.0);
         // -- QUERY rows (one per SQL) --
         for (BenchmarkRunner.QueryResultRow row : queries) {
-            sb.append("QUERY,").append(row.timestamp()).append(',')
-                    .append(row.javaVersion()).append(',')
-                    .append(row.rustVersion()).append(',')
-                    .append(row.dataFusionVersion()).append(',')
-                    .append(row.arrowVersion()).append(',')
-                    .append(row.messages()).append(',')
-                    .append(row.remittancesPerMessage()).append(',')
-                    .append(row.transactionsPerRemittance()).append(',')
-                    .append(row.profile()).append(',')
-                    .append(row.resultRows()).append(',')
-                    .append(row.queryName()).append(',')
-                    .append(quote(row.sql())).append(',')
-                    .append(row.resultRows()).append(',')
-                    .append(row.planMs()).append(',')
-                    .append(row.executeMs()).append(',')
-                    .append(row.resultTransferMs()).append(',')
-                    .append(String.format("%.0f", row.peakRssBytes() / 1048576.0)).append(',')
-                    .append(String.format("%.0f", row.javaHeapBytes() / 1048576.0)).append('\n');
+            String[] fields = {
+                    "QUERY", row.timestamp(),
+                    row.javaVersion(), row.rustVersion(), row.dataFusionVersion(), row.arrowVersion(),
+                    String.valueOf(row.messages()),
+                    String.valueOf(row.remittancesPerMessage()),
+                    String.valueOf(row.transactionsPerRemittance()),
+                    row.profile(),
+                    "", // transactions: dataset total, not per query
+                    row.queryName(), // stage_name
+                    "", // stage_ms
+                    "", // value_name
+                    "", // value
+                    String.format("%.0f", row.peakRssBytes() / 1048576.0),
+                    String.format("%.0f", row.javaHeapBytes() / 1048576.0),
+                    quote(row.sql()),
+                    String.valueOf(row.resultRows()),
+                    String.valueOf(row.planMs()),
+                    String.valueOf(row.executeMs()),
+                    String.valueOf(row.resultTransferMs())
+            };
+            sb.append(String.join(",", fields)).append('\n');
         }
         Files.writeString(withSuffix(outputBase, ".csv"), sb.toString(), StandardCharsets.UTF_8);
     }
 
     private static void loadRow(StringBuilder sb,
-                                java.util.List<BenchmarkRunner.QueryResultRow> queries,
-                                BenchmarkRunner.LoadResult load,
-                                String stageName, double stageMs,
-                                String valueName, Double value) {
-        sb.append("LOAD,").append(Instant.now()).append(',')
-                .append(csvVersions(queries)).append(',')
-                .append(load.messages()).append(',')
-                .append(load.shape().remittancesPerMessage()).append(',')
-                .append(load.shape().transactionsPerRemittance()).append(',')
-                .append(load.profile()).append(',')
-                .append(load.transactions()).append(',')
-                .append(stageName).append(',')
-                .append(String.format("%.3f", stageMs)).append(',')
-                .append(valueName == null ? "" : valueName).append(',')
-                .append(value == null ? "" : String.format("%.1f", value)).append(',')
-                .append(String.format("%.0f", load.peakRssBytes() / 1048576.0)).append(',')
-                .append(String.format("%.0f", load.javaHeapBytes() / 1048576.0)).append('\n');
+            java.util.List<BenchmarkRunner.QueryResultRow> queries,
+            BenchmarkRunner.LoadResult load,
+            String stageName, double stageMs,
+            String valueName, Double value) {
+        String[] versions = versionFields(queries);
+        String[] fields = {
+                "LOAD", load.timestamp(),
+                versions[0], versions[1], versions[2], versions[3],
+                String.valueOf(load.messages()),
+                String.valueOf(load.shape().remittancesPerMessage()),
+                String.valueOf(load.shape().transactionsPerRemittance()),
+                load.profile(),
+                String.valueOf(load.transactions()),
+                stageName,
+                String.format("%.3f", stageMs),
+                valueName == null ? "" : valueName,
+                value == null ? "" : String.format("%.1f", value),
+                String.format("%.0f", load.peakRssBytes() / 1048576.0),
+                String.format("%.0f", load.javaHeapBytes() / 1048576.0),
+                "", "", "", "", "", // query-only columns, empty for LOAD
+        };
+        sb.append(String.join(",", fields)).append('\n');
     }
 
-    private static String csvVersions(java.util.List<BenchmarkRunner.QueryResultRow> queries) {
+    private static String[] versionFields(java.util.List<BenchmarkRunner.QueryResultRow> queries) {
         if (queries.isEmpty()) {
-            return System.getProperty("java.version") + ",unknown,unknown,unknown";
+            return new String[] {
+                    System.getProperty("java.version"), "unknown", "unknown", "unknown" };
         }
         BenchmarkRunner.QueryResultRow first = queries.get(0);
-        return first.javaVersion() + "," + first.rustVersion() + ","
-                + first.dataFusionVersion() + "," + first.arrowVersion();
+        return new String[] {
+                first.javaVersion(), first.rustVersion(),
+                first.dataFusionVersion(), first.arrowVersion() };
     }
 
     private static String quote(String sql) {

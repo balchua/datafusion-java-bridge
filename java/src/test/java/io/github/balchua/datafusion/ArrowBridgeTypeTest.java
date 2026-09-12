@@ -138,62 +138,69 @@ class ArrowBridgeTypeTest {
                     VectorSchemaRoot out = result.next();
                     try (out) {
                         assertEquals(3, out.getRowCount());
-                        VarCharVector os = (VarCharVector) out.getVector("s");
-                        assertEquals("hello", os.getObject(0).toString());
-                        assertEquals("tail", os.getObject(1).toString());
-                        assertNull(os.getObject(2));
-
-                        IntVector oi32 = (IntVector) out.getVector("i32");
-                        assertEquals(1, (int) oi32.getObject(0));
-                        assertNull(oi32.getObject(1)); // tail row: i32 was null
-                        assertEquals(2, (int) oi32.getObject(2));
-
-                        BigIntVector oi64 = (BigIntVector) out.getVector("i64");
-                        assertEquals(1234567890123L, oi64.getObject(0));
-                        assertEquals(42L, oi64.getObject(1));
-                        assertEquals(-5L, oi64.getObject(2));
-
-                        BitVector oflag = (BitVector) out.getVector("flag");
-                        assertEquals(Boolean.TRUE, oflag.getObject(0));
-                        assertNull(oflag.getObject(1));
-                        assertEquals(Boolean.FALSE, oflag.getObject(2));
-
-                        DecimalVector odec = (DecimalVector) out.getVector("dec");
-                        assertEquals(BigDecimal.valueOf(1234.5).setScale(4, RoundingMode.UNNECESSARY),
-                                odec.getObject(0));
-                        assertEquals(BigDecimal.valueOf(-0.5).setScale(4, RoundingMode.UNNECESSARY),
-                                odec.getObject(1));
-                        assertNull(odec.getObject(2));
-
-                        TimeStampMilliVector ots = (TimeStampMilliVector) out.getVector("ts");
-                        assertEquals(1772995200000L, ots.get(0));
-                        assertEquals(1772995202000L, ots.get(1));
-                        assertEquals(1772995201000L, ots.get(2));
-
-                        DateDayVector oday = (DateDayVector) out.getVector("day");
-                        assertEquals(20000, (int) oday.getObject(0));
-                        assertNull(oday.getObject(1));
-                        assertEquals(20001, (int) oday.getObject(2));
-
-                        StructVector ost = (StructVector) out.getVector("st");
-                        IntVector oInnerI = (IntVector) ost.getChild("inner_i");
-                        VarCharVector oInnerS = (VarCharVector) ost.getChild("inner_s");
-                        assertEquals(7, (int) oInnerI.getObject(0));
-                        assertEquals("A", oInnerS.getObject(0).toString());
-                        assertEquals(9, (int) oInnerI.getObject(1));
-                        assertNull(ost.getObject(2)); // whole struct null
-
-                        ListVector olst = (ListVector) out.getVector("lst");
-                        assertEquals(List.of(10, 20), olst.getObject(0));
-                        assertNull(olst.getObject(1)); // tail row: list itself is null
-                        // row 2 (s = null): list [null]
-                        @SuppressWarnings("unchecked")
-                        List<Integer> nullElementList = (List<Integer>) olst.getObject(2);
-                        assertEquals(1, nullElementList.size());
-                        assertNull(nullElementList.get(0));
+                        assertScalarColumns(out);
+                        assertNestedColumns(out);
                     }
                 }
             }
         }
+    }
+
+    private static void assertScalarColumns(VectorSchemaRoot out) {
+        VarCharVector os = (VarCharVector) out.getVector("s");
+        assertEquals("hello", os.getObject(0).toString());
+        assertEquals("tail", os.getObject(1).toString());
+        assertNull(os.getObject(2));
+
+        IntVector oi32 = (IntVector) out.getVector("i32");
+        assertEquals(1, (int) oi32.getObject(0));
+        assertNull(oi32.getObject(1)); // tail row: i32 was null
+        assertEquals(2, (int) oi32.getObject(2));
+
+        BigIntVector oi64 = (BigIntVector) out.getVector("i64");
+        assertEquals(1234567890123L, oi64.getObject(0));
+        assertEquals(42L, oi64.getObject(1));
+        assertEquals(-5L, oi64.getObject(2));
+
+        BitVector oflag = (BitVector) out.getVector("flag");
+        assertEquals(Boolean.TRUE, oflag.getObject(0));
+        assertNull(oflag.getObject(1));
+        assertEquals(Boolean.FALSE, oflag.getObject(2));
+
+        DecimalVector odec = (DecimalVector) out.getVector("dec");
+        assertEquals(BigDecimal.valueOf(1234.5).setScale(4, RoundingMode.UNNECESSARY),
+                odec.getObject(0));
+        assertEquals(BigDecimal.valueOf(-0.5).setScale(4, RoundingMode.UNNECESSARY),
+                odec.getObject(1));
+        assertNull(odec.getObject(2));
+
+        TimeStampMilliVector ots = (TimeStampMilliVector) out.getVector("ts");
+        assertEquals(1772995200000L, ots.get(0));
+        assertEquals(1772995202000L, ots.get(1));
+        assertEquals(1772995201000L, ots.get(2));
+
+        DateDayVector oday = (DateDayVector) out.getVector("day");
+        assertEquals(20000, (int) oday.getObject(0));
+        assertNull(oday.getObject(1));
+        assertEquals(20001, (int) oday.getObject(2));
+    }
+
+    private static void assertNestedColumns(VectorSchemaRoot out) {
+        StructVector ost = (StructVector) out.getVector("st");
+        IntVector oInnerI = (IntVector) ost.getChild("inner_i");
+        VarCharVector oInnerS = (VarCharVector) ost.getChild("inner_s");
+        assertEquals(7, (int) oInnerI.getObject(0));
+        assertEquals("A", oInnerS.getObject(0).toString());
+        assertEquals(9, (int) oInnerI.getObject(1));
+        assertNull(ost.getObject(2)); // whole struct null
+
+        ListVector olst = (ListVector) out.getVector("lst");
+        assertEquals(List.of(10, 20), olst.getObject(0));
+        assertNull(olst.getObject(1)); // tail row: list itself is null
+        // row 2 (s = null): list [null]
+        @SuppressWarnings("unchecked")
+        List<Integer> nullElementList = (List<Integer>) olst.getObject(2);
+        assertEquals(1, nullElementList.size());
+        assertNull(nullElementList.get(0));
     }
 }

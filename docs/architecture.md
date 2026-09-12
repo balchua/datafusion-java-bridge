@@ -144,6 +144,11 @@ blobs, no flattening) so SQL like `WHERE debtor.account.iban = '…'` works nati
   thread while blocked — this is documented and accepted for v1 (correctness over async JNI).
 * Cancellation: `QueryResult.cancel()` aborts the query task; the next `next()` throws
   `QueryCancelledException`. Closing the engine cancels all live queries first.
+* Teardown deadline: `engineClose` waits up to `EngineConfig.closeTimeoutMillis` (default
+  60 s, `0` = forever) for in-flight native calls. `queryToParquet`/`registerParquet` run
+  synchronously with no cancellation token, so a stalled object-store call can outlast the
+  deadline; the engine is then leaked rather than freed, avoiding a use-after-free. The
+  timeout is a safety net — it does not make a hung call finish.
 * **Results are not shareable across threads.** `QueryResult` is a single-consumer pull
   stream (one thread may call `next()`) and each returned `VectorSchemaRoot` wraps native
   memory with manual ownership (see `arrow-lifetime.md`); Arrow Java vectors are not

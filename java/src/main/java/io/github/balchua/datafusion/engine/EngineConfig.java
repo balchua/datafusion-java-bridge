@@ -21,6 +21,9 @@ public final class EngineConfig {
     private final String parquetCompression;
     private final S3 s3;
     private final boolean zeroCopy;
+    /** How long {@link DataFusionEngine#close()} waits for in-flight native calls before
+     *  giving up and leaking the engine. Milliseconds; 0 = wait forever. */
+    private final long closeTimeoutMillis;
 
     private EngineConfig(Builder b) {
         this.memoryLimitBytes = b.memoryLimitBytes;
@@ -29,6 +32,7 @@ public final class EngineConfig {
         this.parquetCompression = b.parquetCompression;
         this.s3 = b.s3;
         this.zeroCopy = b.zeroCopy;
+        this.closeTimeoutMillis = b.closeTimeoutMillis;
     }
 
     public static Builder builder() {
@@ -86,6 +90,7 @@ public final class EngineConfig {
         private String parquetCompression = "snappy";
         private S3 s3;
         private boolean zeroCopy = true; // zero-copy is the default ingest mode
+        private long closeTimeoutMillis = 60_000; // 60 s safety net for in-flight calls
 
         public Builder memoryLimitBytes(long bytes) { this.memoryLimitBytes = bytes; return this; }
         public Builder parallelism(int parallelism) { this.parallelism = parallelism; return this; }
@@ -101,6 +106,20 @@ public final class EngineConfig {
          * table is dropped: Rust then owns its own copy. See docs/arrow-lifetime.md.
          */
         public Builder zeroCopyIngest(boolean zeroCopy) { this.zeroCopy = zeroCopy; return this; }
+        /**
+         * How long {@link DataFusionEngine#close()} waits for in-flight native calls
+         * (e.g. a slow {@code queryToParquet} upload) before giving up and leaking the
+         * engine rather than risking a use-after-free. Default 60,000 ms.
+         *
+         * <p><b>0 waits forever</b> — no leak is possible, but a genuinely hung call makes
+         * close block indefinitely. This is a safety-net knob, not a substitute for
+         * cancellation; a longer timeout does not make a hung call finish.
+         */
+        public Builder closeTimeoutMillis(long millis) { this.closeTimeoutMillis = millis; return this; }
+        /** Convenience overload of {@link #closeTimeoutMillis(long)}. */
+        public Builder closeTimeout(java.time.Duration timeout) {
+            return closeTimeoutMillis(timeout.toMillis());
+        }
         /** Configures S3-compatible storage. */
         public Builder s3(java.util.function.Consumer<S3.Builder> customizer) {
             S3.Builder b = S3.builder();
@@ -151,6 +170,7 @@ public final class EngineConfig {
             sb.append(",\"parquet_compression\":").append(jsonString(parquetCompression));
         }
         sb.append(",\"zero_copy\":").append(zeroCopy);
+        sb.append(",\"close_timeout_millis\":").append(closeTimeoutMillis);
         if (s3 != null) {
             sb.append(",\"s3\":{");
             StringBuilder s3Json = new StringBuilder();
@@ -184,6 +204,7 @@ public final class EngineConfig {
                 + ", scratchDir=" + scratchDir
                 + ", parquetCompression=" + parquetCompression
                 + ", zeroCopy=" + zeroCopy
+                + ", closeTimeoutMillis=" + closeTimeoutMillis
                 + ", s3=" + (s3 != null ? "configured" : "none") + '}';
     }
 }
