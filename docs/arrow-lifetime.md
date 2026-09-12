@@ -26,6 +26,39 @@ The invariant we must never break:
 The C Data Interface transfer itself is identical and zero-copy in both modes; the
 difference is only whether `arrow_bridge.rs` then runs `deep_copy()`.
 
+### When to use which mode
+
+Both modes return identical query results; the choice is purely about **memory ownership
+and lifetime**.
+
+**Zero-copy (default) — a dataset that is built once and then frozen.**
+Choose it when:
+
+* the pipeline is "build the complete Arrow dataset -> register -> query repeatedly ->
+  close", which is the intended payment flow;
+* the dataset is large relative to available memory: only one copy exists, so peak RSS is
+  roughly halved and `registerArrow` is O(1) instead of a multi-GB memcpy;
+* the data is queried many times while it is registered (validation, screening, reporting);
+* the allocator is guaranteed to outlive the engine (the engine is closed first).
+
+**Deep-copy — the Java side keeps ownership of its buffers.**
+Choose it when:
+
+* the Java side **recycles buffers**: a streaming parser that `clear()`s and refills the same
+  `VectorSchemaRoot` per batch. With zero-copy, DataFusion would observe the refilled data
+  (silent corruption); deep-copy detaches the registered table from the live root.
+* you must **reclaim Java off-heap memory before the table is dropped** — e.g. a tight
+  allocator budget, or one long-lived allocator reused to build many datasets over time.
+  Deep-copy transfers ownership to Rust so Java can free immediately.
+* the vectors are mutated by code you do not control, or you cannot guarantee the allocator
+  outlives the engine; deep-copy is the defensive, always-safe choice.
+* the engine may **outlive the Java component that produced the batch** (e.g. the engine is
+  passed to another subsystem) and you do not want to pin the producer's memory.
+
+**Rule of thumb:** one immutable dataset -> zero-copy; recycled/mutable buffers or memory you
+must reclaim early -> deep-copy.
+
+
 ## The C Data Interface contract
 
 ```text

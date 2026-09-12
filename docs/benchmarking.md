@@ -44,8 +44,8 @@ SQL text and its one-line explanation, plus three timings:
 `execute_ms` and `result_transfer_ms` overlap (the producer runs ahead into a bounded
 channel); do not add them. The real query wall time is roughly `max(execute, transfer)`.
 
-Select queries with `--queries q1,q3,q5`; with no `--queries` argument only the LOAD phase
-runs (useful for measuring ingestion alone).
+Select queries with `--queries all` (every query) or a subset like `--queries q1,q3,q5`;
+with no `--queries` argument only the LOAD phase runs (useful for measuring ingestion alone).
 
 ## Dataset shape (mandatory)
 
@@ -76,9 +76,10 @@ Counts are reported in the output so they are never assumed.
 | `q4` | filter on a struct-in-struct field (`debtor.account.iban`) |
 | `q5` | aggregation with exact Decimal128 (`GROUP BY currency, SUM(amount)`) |
 | `q6` | three-table join (message × remittance × transaction) |
-| `q7` | per-remittance validation report (declared vs actual count/sum) |
+| `q7` | per-remittance control-sum validation (declared vs actual count/sum + `balanced` flag) |
 | `q8` | scan of a real JSON payload column (`regulatory_reporting LIKE …`) |
 | `q9` | deep typed Struct path (`ultimate_debtor.account.iban`) |
+| `q10` | mismatch summary: count of remittances whose count/sum differ from the declared control sum |
 
 New queries are one enum entry in `BenchmarkQuery`.
 
@@ -91,6 +92,10 @@ default; multi-batch ingestion can be added later without an API change.
 
 `--out FILE` writes `FILE.json` and `FILE.csv`. The JSON has a `load` block and a `queries`
 array; the CSV is long-format with a `phase` column (`LOAD` / `QUERY`).
+
+`--dump-parquet DEST` additionally exports the three loaded tables to
+`DEST/<table>.parquet` (via the Rust Parquet writer) so the exact input can be inspected
+externally, e.g. with DuckDB.
 
 ## Methodology rules
 

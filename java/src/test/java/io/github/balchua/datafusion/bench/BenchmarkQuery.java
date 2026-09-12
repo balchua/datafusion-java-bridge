@@ -26,17 +26,33 @@ public enum BenchmarkQuery {
                     + "JOIN transactions t ON t.remittance_id = r.remittance_id "
                     + "GROUP BY m.message_id, r.remittance_id"),
     Q7_VALIDATION("q7_remittance_control_validation",
-            "SELECT r.remittance_id AS rid, r.number_of_transactions AS declared, "
-                    + "COUNT(t.transaction_id) AS actual, SUM(t.amount) AS txn_sum "
+            // Per-remittance check: transaction count and SUM(amount) must equal the
+            // remittance's declared number_of_transactions and control_sum (pain.001 CtrlSum).
+            "SELECT r.remittance_id AS rid, "
+                    + "r.number_of_transactions AS declared_count, "
+                    + "COUNT(t.transaction_id) AS actual_count, "
+                    + "r.control_sum AS declared_sum, "
+                    + "SUM(t.amount) AS actual_sum, "
+                    + "(COUNT(t.transaction_id) = r.number_of_transactions "
+                    + " AND SUM(t.amount) = r.control_sum) AS balanced "
                     + "FROM remittances r LEFT JOIN transactions t "
                     + "ON t.remittance_id = r.remittance_id "
-                    + "GROUP BY r.remittance_id, r.number_of_transactions"),
+                    + "GROUP BY r.remittance_id, r.number_of_transactions, r.control_sum"),
     Q8_JSON_SCAN("q8_json_column_scan",
             "SELECT transaction_id FROM transactions "
                     + "WHERE regulatory_reporting LIKE '%Dmstcd%'"),
     Q9_DEEP_STRUCT_PATH("q9_ultimate_party_filter",
             "SELECT transaction_id FROM transactions "
-                    + "WHERE ultimate_debtor.account.iban = 'FR1400000430000000000'");
+                    + "WHERE ultimate_debtor.account.iban = 'FR1400000430000000000'"),
+    Q10_CONTROL_SUM_MISMATCHES("q10_control_sum_mismatches",
+            // Validation summary: how many remittances fail the control-sum/count check.
+            // Zero on a well-formed payment; non-zero flags the offending remittances.
+            "SELECT COUNT(*) AS mismatched_remittances FROM ("
+                    + "SELECT r.remittance_id FROM remittances r "
+                    + "LEFT JOIN transactions t ON t.remittance_id = r.remittance_id "
+                    + "GROUP BY r.remittance_id, r.number_of_transactions, r.control_sum "
+                    + "HAVING COUNT(t.transaction_id) <> r.number_of_transactions "
+                    + "OR SUM(t.amount) <> r.control_sum) x");
 
     private static final class SQL_CONSTANTS {
         static final String MATCH = "BBB";
@@ -65,6 +81,7 @@ public enum BenchmarkQuery {
             case "q7_remittance_control_validation" -> "validation report: per-remittance declared vs actual count/sum";
             case "q8_json_column_scan" -> "JSON column scan: LIKE over the regulatory_reporting JSON payload";
             case "q9_ultimate_party_filter" -> "deep struct path: WHERE ultimate_debtor.account.iban = '…' (3 struct levels)";
+            case "q10_control_sum_mismatches" -> "control-sum validation: count remittances whose transaction count/sum differ from the declared control sum";
             default -> "SQL benchmark query";
         };
     }

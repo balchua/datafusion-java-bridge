@@ -140,7 +140,7 @@ public final class NarrowPain001 {
             ctrlSum.setSafe(r, DEC_18_2);
             svcLvl.setSafe(r, "SEPA".getBytes());
             exctnDt.setSafe(r, 20000 + r % 30);
-            dbtrNm.setSafe(r, "DEBTOR-" + (r % 97).getBytes());
+            dbtrNm.setSafe(r, ("DEBTOR-" + (r % 97)).getBytes());
             dbtrIban.setSafe(r, ("DE" + (100000000 + r) + "0000000000").getBytes());
             dbtrBic.setSafe(r, "COBADEFFXXX".getBytes());
             btchBookg.setSafe(r, "true".getBytes());

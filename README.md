@@ -77,12 +77,147 @@ try (DataFusionEngine engine = new DataFusionEngine(EngineConfig.defaults())) {
             "SELECT transaction_id FROM transactions WHERE debtor.account.iban = '…'")) {
         VectorSchemaRoot batch;
         while ((batch = result.next()) != null) {        // streamed, Arrow-native
-            try (batch) { /* read columns */ }
+            try (VectorSchemaRoot current = batch) {     // close each returned root
+                // read values: current.getVector("transaction_id").getObject(0)
+            }
         }
     }
     engine.queryToParquet(sql, "s3://bucket/out.parquet"); // encoded in Rust
 }
 ```
+
+## Reading query results
+
+Results stream back as Arrow `VectorSchemaRoot` batches — never `List<Row>`. Each returned
+root wraps native memory and must be closed (try-with-resources). Read values straight off
+the vectors with `getObject(i)`, which returns the natural Java type: `String`,
+`Integer`/`Long`, `Boolean`, `BigDecimal`, `LocalDateTime`, and `Map`/`List` for nested
+Struct/List columns.
+
+```java
+import io.github.balchua.datafusion.engine.DataFusionEngine;
+import io.github.balchua.datafusion.engine.EngineConfig;
+import io.github.balchua.datafusion.engine.QueryResult;
+import org.apache.arrow.vector.VectorSchemaRoot;
+
+import java.math.BigDecimal;
+
+// 1. one engine per payment/job
+try (DataFusionEngine engine = new DataFusionEngine(EngineConfig.defaults())) {
+
+    // 2. register Java Arrow batches as tables. (The Arrow builders for these roots live
+    //    in the sample PaymentSchemas / TestPayments classes under java/src/test.)
+    engine.registerArrow("payment_message", messageRoot);
+    engine.registerArrow("remittances",     remittancesRoot);
+    engine.registerArrow("transactions",    transactionsRoot);
+
+    // 3. the control-sum check: transactions vs the remittance's declared control values
+    String sql = """
+        SELECT r.remittance_id          AS rid,
+               r.number_of_transactions AS declared_count,
+               COUNT(t.transaction_id)   AS actual_count,
+               r.control_sum             AS declared_sum,
+               SUM(t.amount)             AS actual_sum,
+               (COUNT(t.transaction_id) = r.number_of_transactions
+                AND SUM(t.amount) = r.control_sum) AS balanced
+        FROM remittances r
+        LEFT JOIN transactions t ON t.remittance_id = r.remittance_id
+        GROUP BY r.remittance_id, r.number_of_transactions, r.control_sum
+        ORDER BY r.remittance_id
+        """;
+
+    try (QueryResult result = engine.query(sql)) {
+        VectorSchemaRoot batch;
+        while ((batch = result.next()) != null) {           // streaming: zero or more batches
+            try (VectorSchemaRoot current = batch) {        // always close a returned root
+                for (int i = 0; i < current.getRowCount(); i++) {
+                    String rid           = current.getVector("rid").getObject(i).toString();
+                    Number declaredCount = (Number)     current.getVector("declared_count").getObject(i);
+                    Number actualCount   = (Number)     current.getVector("actual_count").getObject(i);
+                    BigDecimal declared  = (BigDecimal) current.getVector("declared_sum").getObject(i);
+                    BigDecimal actual    = (BigDecimal) current.getVector("actual_sum").getObject(i);
+                    Boolean balanced     = (Boolean)    current.getVector("balanced").getObject(i);
+                    System.out.printf("%s declared=%s/%s actual=%s/%s balanced=%s%n",
+                            rid, declaredCount, declared, actualCount, actual, balanced);
+                }
+            }
+        }
+    }
+}
+```
+
+To get just the failures, run the mismatch summary and read the single count:
+
+```java
+try (QueryResult result = engine.query("""
+        SELECT COUNT(*) AS mismatched FROM (
+            SELECT r.remittance_id FROM remittances r
+            LEFT JOIN transactions t ON t.remittance_id = r.remittance_id
+            GROUP BY r.remittance_id, r.number_of_transactions, r.control_sum
+            HAVING COUNT(t.transaction_id) <> r.number_of_transactions
+                OR SUM(t.amount) <> r.control_sum) x
+        """)) {
+    VectorSchemaRoot batch = result.next();
+    try (batch) {
+        long mismatched = (Long) batch.getVector("mismatched").getObject(0); // COUNT(*) -> Int64
+        System.out.println("remittances failing control-sum check: " + mismatched);
+    }
+}
+```
+
+Notes:
+
+* String columns return Arrow's `org.apache.arrow.vector.util.Text`; call `.toString()`
+  (or cast to `Text`) as shown for `rid`.
+* Nested columns are read the same way: e.g. `batch.getVector("debtor").getObject(i)` returns
+  a `Map` (`name`, `account`, `agent_bic`), and `structured_remittance` returns a `List`.
+* Types: `COUNT(*)` is `Int64` (`Long`); `number_of_transactions` is `Int32` (`Integer`);
+  decimal columns are `BigDecimal`; booleans are `Boolean` (may be `null`).
+* This is the same query the benchmark ships as `q7` (per-remittance) and `q10` (mismatch
+  count); see `benchmark/README.md`.
+* With the default zero-copy ingest, close the engine before the Arrow `RootAllocator`
+  (see "Ingest modes" below).
+
+## Simple example program
+
+[`SimpleExample.java`](java/src/test/java/io/github/balchua/datafusion/examples/SimpleExample.java)
+is a self-contained runnable example that deliberately uses a trivial `people` table —
+`id Int32, name Utf8, salary Decimal128(10,2), active Bool` — instead of payment fields. It
+builds the Arrow table, registers it, runs projection/filter/aggregation SQL, reads the
+result values, and round-trips the result through Parquet.
+
+```bash
+MAVEN_OPTS="--enable-native-access=ALL-UNNAMED --add-opens=java.base/java.nio=ALL-UNNAMED" \
+  mvn -pl java exec:java -Dexec.classpathScope=test \
+      -Dexec.mainClass=io.github.balchua.datafusion.examples.SimpleExample
+```
+
+Output:
+
+```text
+built 'people': 8 rows, 4 columns
+
+SQL: SELECT id, name, salary FROM people WHERE active = true ORDER BY id
+  id=0  name=alice  salary=1000.00
+  id=2  name=carol  salary=1250.00
+  id=4  name=erin   salary=1500.00
+  id=6  name=grace  salary=1750.00
+
+SQL: SELECT COUNT(*) AS n, SUM(salary) AS total FROM people
+  n=8  total=11500.00
+
+SQL: SELECT name FROM people WHERE salary > 1500.00 ORDER BY name
+  name=frank
+  name=grace
+  name=heidi
+
+SQL: SELECT COUNT(*) AS n FROM people_parquet
+  n=8
+```
+
+It also demonstrates the resource/ownership pattern for the default zero-copy ingest:
+the Java `VectorSchemaRoot` is closed immediately after `registerArrow`, the engine is
+closed before the `RootAllocator`, and every returned result root is closed.
 
 ## Benchmark
 
@@ -106,7 +241,35 @@ DFE_JVM_OPTS="-Xmx12g" benchmark/run-benchmark.sh --messages 1 \
 Two phases in the output: **LOAD** (Arrow generation + time/memory to load into
 DataFusion) and **QUERY** (each SQL printed with its own plan/execute/result-transfer
 numbers). Sizes up to **2M** transactions — always one RecordBatch per table.
-Query selection: `--queries q1,q3,q5`; with no `--queries` only the LOAD phase runs.
+
+Key arguments (full reference: `benchmark/README.md`):
+
+| Argument | Default | Meaning |
+|---|---|---|
+| `--messages N` | 1 | number of messages |
+| `--remittances-per-message N` | required | remittances per message |
+| `--transactions-per-remittance N` | 25 | transactions per remittance |
+| `--profile normal\|wide\|narrow` | normal | schema profile |
+| `--queries all` \| `q1,q3,q5` | none | SQLs to run; `all` runs every query; omit for LOAD only |
+| `--out FILE` | bench/results.json | writes FILE.json + FILE.csv |
+| `--deep-copy` | *(zero-copy)* | deep-copy ingest |
+| `--dump-parquet DEST` | | export loaded tables to `DEST/<table>.parquet` for DuckDB inspection |
+| `--s3-bucket/-endpoint/-region/-access-key/-secret-key/-allow-http` | | S3 |
+
+Queries (select with `--queries`, ids or full names; full SQL printed in every output row):
+
+| id | SQL shape |
+|---|---|
+| `q1` | projection over all rows |
+| `q2` | projection into a Struct field |
+| `q3` | filter on `debtor.name` |
+| `q4` | filter on `debtor.account.iban` |
+| `q5` | `GROUP BY currency, COUNT(*), SUM(amount)` (exact Decimal128) |
+| `q6` | three-table join |
+| `q7` | per-remittance control-sum check (declared vs actual count/sum + `balanced`) |
+| `q8` | scan real JSON column (`regulatory_reporting LIKE …`) |
+| `q9` | deep Struct path (`ultimate_debtor.account.iban`) |
+| `q10` | count of remittances failing the control-sum check (0 = all balanced) |
 
 ## Ingest modes: deep-copy vs zero-copy
 
@@ -133,8 +296,16 @@ dataset while parsing, register it once, query, close. Rules (full version:
 4. Closing the Java root early is safe (Arrow's exporter retains the buffers); mutating it is not.
 
 **Deep-copy (`zeroCopyIngest(false)`)** — Rust owns a copy; Java may close or reuse its
-vectors immediately. Use it only when you recycle/refill a `VectorSchemaRoot` after
-registering, or must free Java buffers before the table is dropped.
+vectors immediately.
+
+Both modes return identical results; the choice is about **ownership and lifetime**:
+
+| choose zero-copy when | choose deep-copy when |
+|---|---|
+| you build the complete dataset once, then only read | you `clear()`/refill a root per batch (recycling buffers) |
+| the dataset is large and memory is tight (one copy, ~½ peak) | you must reclaim Java off-heap memory before the table is dropped |
+| registration must be O(1), not a multi-GB memcpy | the vectors are mutated by code you don't control |
+| the allocator outlives the engine | the engine may outlive the producer of the batch |
 
 ```java
 try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);

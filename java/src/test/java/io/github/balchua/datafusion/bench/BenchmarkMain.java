@@ -19,6 +19,7 @@ import java.util.List;
  * </pre>
  *
  * Examples (from the repo root):
+ * 
  * <pre>
  * # 4 messages, 10 remittances each, 2500 transactions each (= 100k transactions)
  * benchmark/run-benchmark.sh --messages 4 --remittances-per-message 10 \\
@@ -43,20 +44,32 @@ public final class BenchmarkMain {
         Files.createDirectories(out.getParent() == null ? Path.of(".") : out.getParent());
 
         try (MemoryMonitor monitor = new MemoryMonitor(100);
-             org.apache.arrow.memory.RootAllocator allocator =
-                     new org.apache.arrow.memory.RootAllocator(Long.MAX_VALUE)) {
+                org.apache.arrow.memory.RootAllocator allocator = new org.apache.arrow.memory.RootAllocator(
+                        Long.MAX_VALUE)) {
             BenchmarkRunner runner = new BenchmarkRunner(
                     allocator, p.engineConfig(), monitor, p.s3Bucket);
 
             // ---------- PHASE 1: LOAD ----------
             var shape = p.shape();
-            System.out.printf("== LOAD: %d message(s) x %d remittance(s)/message x %d transaction(s)/remittance = %,d transactions ==%n",
+            System.out.printf(
+                    "== LOAD: %d message(s) x %d remittance(s)/message x %d transaction(s)/remittance = %,d transactions ==%n",
                     shape.messages(), shape.remittancesPerMessage(),
                     shape.transactionsPerRemittance(), shape.transactions());
             BenchmarkRunner.LoadedDataset dataset = runner.load(shape, p.profile);
             printLoad(dataset.result());
 
+            // Optional: export the loaded tables so external tools (e.g. DuckDB) can inspect
+            // exactly the data that was handed to DataFusion.
+            if (p.dumpParquet != null) {
+                dumpTables(dataset, p.dumpParquet);
+            }
+
             // ---------- PHASE 2: QUERIES ----------
+            if (NarrowPain001.PROFILE.equals(p.profile) && !p.queries.isEmpty()) {
+                System.err.println("note: --profile narrow uses a flat pain.001-like schema; "
+                        + "the canonical benchmark queries do not apply, running LOAD only");
+                p.queries.clear();
+            }
             List<BenchmarkRunner.QueryResultRow> rows = new ArrayList<>();
             if (!p.queries.isEmpty()) {
                 System.out.println("== QUERIES ==");
@@ -71,6 +84,28 @@ public final class BenchmarkMain {
             System.out.println(">> wrote " + out.toAbsolutePath() + " (+ .csv)");
             dataset.close();
         }
+    }
+
+    /**
+     * Exports each loaded table to Parquet via Rust (queryToParquet). `dest` is a local
+     * directory, or an s3:// prefix. Files are named {@code <table>.parquet}.
+     */
+    private static void dumpTables(BenchmarkRunner.LoadedDataset dataset, String dest) throws Exception {
+        boolean url = dest.contains("://");
+        if (!url) {
+            Files.createDirectories(Path.of(dest));
+        }
+        String base = dest.endsWith("/") ? dest.substring(0, dest.length() - 1) : dest;
+        System.out.println("== DUMP (Parquet) ==");
+        for (String table : new String[] {"payment_message", "remittances", "transactions"}) {
+            String target = base + "/" + table + ".parquet";
+            long start = System.nanoTime();
+            dataset.engine().queryToParquet("SELECT * FROM " + table, target);
+            System.out.printf("  %-16s -> %s  (%.0f ms)%n",
+                    table, target, (System.nanoTime() - start) / 1_000_000.0);
+        }
+        System.out.println("  inspect with: duckdb -c \"SELECT * FROM read_parquet('" + base
+                + "/transactions.parquet') LIMIT 5;\"");
     }
 
     private static void printLoad(BenchmarkRunner.LoadResult load) {
@@ -88,7 +123,6 @@ public final class BenchmarkMain {
                 "process memory", load.rssBeforeBytes() / 1048576.0,
                 load.rssAfterBytes() / 1048576.0,
                 load.peakRssBytes() / 1048576.0, load.javaHeapBytes() / 1048576.0);
-        System.out.println("  note: java heap excludes off-heap Arrow buffers and the Rust copy");
     }
 
     private static void printQuery(BenchmarkRunner.QueryResultRow row) {
@@ -100,7 +134,7 @@ public final class BenchmarkMain {
     /** Parsed CLI flags with defaults. */
     private static final class Parsed {
         int messages = 1;
-        int remittancesPerMessage = -1;   // default derived from rows
+        int remittancesPerMessage = -1; // default derived from rows
         int transactionsPerRemittance = 25;
         String profile = "normal";
         List<BenchmarkQuery> queries = new ArrayList<>();
@@ -108,6 +142,7 @@ public final class BenchmarkMain {
         Path scratchDir = Path.of(System.getProperty("java.io.tmpdir"), "dfe-scratch");
         long memoryLimitBytes = 0;
         boolean zeroCopy = true; // zero-copy is the default
+        String dumpParquet;      // optional: export loaded tables to Parquet for inspection
         String s3Bucket;
         String s3Endpoint;
         String s3Region;
@@ -160,32 +195,37 @@ public final class BenchmarkMain {
                     case "--profile" -> p.profile = args[++i];
                     case "--zero-copy" -> p.zeroCopy = true;
                     case "--deep-copy" -> p.zeroCopy = false;
+                    case "--dump-parquet" -> p.dumpParquet = args[++i];
                     case "--queries" -> {
-                        for (String q : args[++i].split(",")) {
-                            String upper = q.trim().toUpperCase();
-                            if (!upper.startsWith("Q")) {
-                                upper = "Q" + upper;
-                            }
-                            BenchmarkQuery match = null;
-                            for (BenchmarkQuery candidate : BenchmarkQuery.values()) {
-                                if (candidate.name().equals(upper)) {
-                                    match = candidate;
-                                    break;
+                        String value = args[++i].trim();
+                        if (value.equalsIgnoreCase("all")) {
+                            p.queries.addAll(java.util.List.of(BenchmarkQuery.values()));
+                        } else {
+                            for (String q : value.split(",")) {
+                                String upper = q.trim().toUpperCase();
+                                if (!upper.startsWith("Q")) {
+                                    upper = "Q" + upper;
                                 }
-                                if (candidate.name().startsWith(upper + "_")) {
-                                    match = candidate;
+                                BenchmarkQuery match = null;
+                                for (BenchmarkQuery candidate : BenchmarkQuery.values()) {
+                                    if (candidate.name().equals(upper)) {
+                                        match = candidate;
+                                        break;
+                                    }
+                                    if (candidate.name().startsWith(upper + "_")) {
+                                        match = candidate;
+                                    }
                                 }
+                                if (match == null) {
+                                    throw new IllegalArgumentException("unknown query: " + q);
+                                }
+                                p.queries.add(match);
                             }
-                            if (match == null) {
-                                throw new IllegalArgumentException("unknown query: " + q);
-                            }
-                            p.queries.add(match);
                         }
                     }
                     case "--out" -> p.out = Path.of(args[++i]);
                     case "--scratch" -> p.scratchDir = Path.of(args[++i]);
-                    case "--memory-limit-gb" -> p.memoryLimitBytes =
-                            Long.parseLong(args[++i]) * 1024 * 1024 * 1024;
+                    case "--memory-limit-gb" -> p.memoryLimitBytes = Long.parseLong(args[++i]) * 1024 * 1024 * 1024;
                     case "--s3-bucket" -> p.s3Bucket = args[++i];
                     case "--s3-endpoint" -> p.s3Endpoint = args[++i];
                     case "--s3-region" -> p.s3Region = args[++i];
@@ -201,34 +241,35 @@ public final class BenchmarkMain {
     }
 
     private static void usage() {
-        System.out.println("""
-                BenchmarkMain — two phases: LOAD (Arrow -> DataFusion, time + memory), then QUERY (SQL shapes)
+        System.out.println(
+                """
+                        BenchmarkMain — two phases: LOAD (Arrow -> DataFusion, time + memory), then QUERY (SQL shapes)
 
-                  Dataset shape (hierarchical, pick one):
-                    --messages N                        number of payment messages
-                    --remittances-per-message N         remittances per message (required)
-                    --transactions-per-remittance N     transactions per remittance (default 25)
-                    --profile normal|wide               schema profile (default normal)
-                    --zero-copy                         zero-copy Arrow ingest (default; no Rust deep copy)
-                    --deep-copy                         deep-copy ingest (Rust owns a copy; Java may
-                                                        reuse/free buffers immediately)
+                          Dataset shape (hierarchical, pick one):
+                            --messages N                        number of payment messages
+                            --remittances-per-message N         remittances per message (required)
+                            --transactions-per-remittance N     transactions per remittance (default 25)
+                            --profile normal|wide               schema profile (default normal)
+                            --zero-copy                         zero-copy Arrow ingest (default; no Rust deep copy)
+                            --deep-copy                         deep-copy ingest (Rust owns a copy; Java may
+                                                                reuse/free buffers immediately)
 
-                  Queries:
-                    --queries q1,q3,q5                  which SQLs to run (default: all)
-                                                        q1 projection              SELECT transaction_id FROM transactions
-                                                        q2 nested projection        ... debtor.name
-                                                        q3 nested filter            WHERE debtor.name = 'BBB'
-                                                        q4 deep nested filter       WHERE debtor.account.iban = '…'
-                                                        q5 aggregation              GROUP BY currency, SUM(amount)
-                                                        q6 join                     message x remittance x transaction
-                                                        q7 validation report        per-remittance declared vs actual
+                          Queries:
+                            --queries all|q1,q3,q5             which SQLs to run (default: none = LOAD only)
+                                                                q1 projection              SELECT transaction_id FROM transactions
+                                                                q2 nested projection        ... debtor.name
+                                                                q3 nested filter            WHERE debtor.name = 'BBB'
+                                                                q4 deep nested filter       WHERE debtor.account.iban = '…'
+                                                                q5 aggregation              GROUP BY currency, SUM(amount)
+                                                                q6 join                     message x remittance x transaction
+                                                                q7 validation report        per-remittance declared vs actual
 
-                  Output / runtime:
-                    --out FILE.json                     writes FILE.json and FILE.csv (default bench/results.json)
-                    --memory-limit-gb N                 DataFusion memory pool limit (default unlimited)
-                    --scratch DIR                       scratch directory
-                    --s3-bucket B, --s3-endpoint U, --s3-region R,
-                    --s3-access-key K, --s3-secret-key K, --s3-allow-http
-                    --help""");
+                          Output / runtime:
+                            --out FILE.json                     writes FILE.json and FILE.csv (default bench/results.json)
+                            --memory-limit-gb N                 DataFusion memory pool limit (default unlimited)
+                            --scratch DIR                       scratch directory
+                            --s3-bucket B, --s3-endpoint U, --s3-region R,
+                            --s3-access-key K, --s3-secret-key K, --s3-allow-http
+                            --help""");
     }
 }

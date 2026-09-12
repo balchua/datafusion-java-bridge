@@ -30,7 +30,9 @@ fi
 
 # 2. Compile + assemble the runtime classpath with Maven (build-time only).
 echo ">> assembling classpath via Maven (not used at benchmark runtime)"
-mvn -q -pl java test-compile
+# clean test-compile: IDEs (Eclipse/JDT in VS Code) can leave error-marked class files in
+# target/test-classes that Maven's incremental compile then treats as up to date.
+mvn -q -pl java clean test-compile
 mvn -q -pl java dependency:copy-dependencies \
     -DincludeScope=runtime \
     -DoutputDirectory="$PWD/java/target/bench-libs" \

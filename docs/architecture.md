@@ -87,7 +87,20 @@ Ingestion has two modes (`EngineConfig.zeroCopyIngest`):
   Rust-owned buffers, so Java can free/reuse its vectors immediately. Cost: one `memcpy`
   and transient 2× memory. For streaming parsers that recycle a root.
 
-Both are described in detail, with Java best practices, in `arrow-lifetime.md`.
+The choice is about memory ownership and lifetime: one immutable dataset that can stay
+pinned -> zero-copy; recycled/mutable buffers or memory that must be reclaimed early ->
+deep-copy. Both are described in detail, with Java best practices and use cases, in
+`arrow-lifetime.md`.
+Measured for 1,000,000 transactions / 207 leaf fields (`normal`):
+
+| metric | deep-copy | zero-copy (default) |
+|---|---:|---:|
+| `load_into_datafusion` | 5,054 ms | **94 ms** |
+| peak RSS | 7,980 MB | **4,391 MB** |
+
+On a comparable flat schema (`narrow`, 15 transaction columns) building the full Arrow
+batch takes ~2.2 s and the DataFusion load ~72 ms (zero-copy), so the payload's field
+count and JSON columns — not the bridge — dominate ingestion cost.
 
 ## RecordBatch strategy
 
