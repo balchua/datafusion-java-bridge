@@ -116,20 +116,23 @@ impl Engine {
         }
     }
 
-    /// Blocks until all in-flight native calls returned (or panics/loops forever if a
-    /// call never returns). Called with the handle already removed from the registry,
-    /// so no new calls can enter.
-    pub fn wait_idle(&self) {
+    /// Blocks until all in-flight native calls returned, or the deadline expires.
+    /// Returns `true` if the engine is idle (safe to free), `false` if a call is still
+    /// running (the caller must NOT free the engine — leaking is safer than a UAF).
+    ///
+    /// Called with the handle already removed from the registry, so no new calls can
+    /// enter and `active_calls` cannot increase.
+    pub fn wait_idle(&self) -> bool {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while self.active_calls.load(Ordering::SeqCst) > 0 {
             if std::time::Instant::now() > deadline {
-                // Defensive: do not block forever on a stuck call. Dropping the engine
-                // may then cause a use-after-free in that call; this is documented as
-                // undefined behavior territory and should never happen in practice.
-                break;
+                // Do not block forever on a stuck call; the caller will leak the engine
+                // rather than drop it, avoiding a use-after-free in that call.
+                return false;
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
+        true
     }
 
     pub fn create(config_json: &str) -> Result<Engine> {
@@ -343,11 +346,12 @@ impl Engine {
     }
 
     /// Drops the query handle: cancels the producer task and releases everything.
+    ///
+    /// Idempotent: an already-drained query (e.g. `engineClose` cancelled it) is a
+    /// success, so a Java `QueryResult.close()` racing an engine close does not throw.
     pub fn close_result(&self, qid: u64) -> Result<()> {
-        match self.queries.lock().unwrap().remove(&qid) {
-            Some(_) => Ok(()),
-            None => Err(self.unknown_query_error(qid)),
-        }
+        self.queries.lock().unwrap().remove(&qid);
+        Ok(())
     }
 
     fn get_query(&self, qid: u64) -> Result<Arc<QueryHandle>> {

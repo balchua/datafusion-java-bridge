@@ -178,6 +178,44 @@ Notes:
 * With the default zero-copy ingest, close the engine before the Arrow `RootAllocator`
   (see "Ingest modes" below).
 
+### Sharing results across threads
+
+`QueryResult` is a single-consumer stream and each `VectorSchemaRoot` it returns wraps
+native buffers with manual ownership, so **neither may be shared across threads**:
+
+* `next()` is stateful — only one thread may pull batches.
+* Arrow Java vectors are not thread-safe; concurrent reads of the same root (nested/`List`
+  types, shared dictionary state) are undefined.
+* Each returned root owns its buffers: close it once, on the thread that owns it. Closing
+  while another thread reads is a use-after-free.
+
+To process a batch in parallel, materialize the rows into plain immutable Java objects
+(records) on the consuming thread, then hand those to the workers:
+
+```java
+record Txn(String id, BigDecimal amount) {}
+
+List<Txn> rows = new ArrayList<>();
+try (QueryResult result = engine.query("SELECT transaction_id, amount FROM transactions")) {
+    VectorSchemaRoot batch;
+    while ((batch = result.next()) != null) {
+        try (batch) {                                        // close on this thread only
+            var ids = batch.getVector("transaction_id");
+            var amounts = batch.getVector("amount");
+            for (int i = 0; i < batch.getRowCount(); i++) {
+                rows.add(new Txn(ids.getObject(i).toString(),
+                                 (BigDecimal) amounts.getObject(i)));
+            }
+        }
+    }
+}
+rows.parallelStream().forEach(row -> process(row));          // safe: plain Java objects
+```
+
+If you must keep Arrow-native parallelism, deep-copy each batch into a fresh
+`VectorSchemaRoot` backed by its own `RootAllocator` (one per worker); never share one
+root's buffers across threads.
+
 ## Simple example program
 
 [`SimpleExample.java`](java/src/test/java/io/github/balchua/datafusion/examples/SimpleExample.java)

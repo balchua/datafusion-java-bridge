@@ -42,13 +42,33 @@ public final class DataFusionEngine implements AutoCloseable {
 
     public DataFusionEngine(EngineConfig config) {
         this.structAllocator = new RootAllocator(Long.MAX_VALUE);
-        this.handle = NativeEngine.engineCreate(config.toNativeJson());
-        if (handle == 0) {
+        long created;
+        try {
+            created = NativeEngine.engineCreate(config.toNativeJson());
+        } catch (RuntimeException | Error e) {
+            structAllocator.close();
+            throw e;
+        }
+        if (created == 0) {
             structAllocator.close();
             throw new DataFusionException(
                     "engine creation failed (see pending exception or prior log)");
         }
-        this.versionInfo = NativeEngine.engineVersion();
+        this.handle = created;
+        try {
+            this.versionInfo = NativeEngine.engineVersion();
+        } catch (RuntimeException | Error e) {
+            // The native engine was created but the constructor cannot return a
+            // usable object; release it so the handle and allocator do not leak.
+            try {
+                NativeEngine.engineClose(created);
+            } catch (RuntimeException closeFailure) {
+                e.addSuppressed(closeFailure);
+            } finally {
+                structAllocator.close();
+            }
+            throw e;
+        }
     }
 
     /** Engine + library version metadata (rustc, DataFusion, arrow). */
@@ -86,8 +106,11 @@ public final class DataFusionEngine implements AutoCloseable {
                         handle, tableName, schemaStruct.memoryAddress(), arrayAddrs);
                 NativeEngine.commitTable(handle, tableName, stagedId);
             } finally {
-                // The C structs were consumed by the native import (release callbacks
-                // fired inside stageArrow); close frees the small Java-side structs.
+                // On the success path Rust's `from_raw` already consumed each struct and
+                // nulled its release pointer, so `release()` is a no-op and `close()` just
+                // frees the small Java-side struct. `release()` is only load-bearing when
+                // `stageArrow` fails early (e.g. a column-count mismatch) and Rust never
+                // consumed some of the arrays.
                 for (ArrowArray a : arrayStructs) {
                     if (a != null) {
                         a.release();
@@ -114,7 +137,18 @@ public final class DataFusionEngine implements AutoCloseable {
             throw new DataFusionException(
                     "query failed (see pending exception)");
         }
-        return new QueryResult(this, queryId);
+        try {
+            return new QueryResult(this, queryId);
+        } catch (RuntimeException | Error e) {
+            // The native query is already registered; if the Java wrapper fails to
+            // construct, release it so it does not leak until engine.close().
+            try {
+                NativeEngine.resultClose(handle, queryId);
+            } catch (RuntimeException closeFailure) {
+                e.addSuppressed(closeFailure);
+            }
+            throw e;
+        }
     }
 
     /**

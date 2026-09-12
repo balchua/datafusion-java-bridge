@@ -4,10 +4,12 @@
 //! direction. See `docs/arrow-lifetime.md` for the full ownership contract.
 //!
 //! Inbound (Java -> Rust): Java exports schema + one `ArrowArray` struct per column
-//! (zero-copy: Arrow Java only increments buffer refcounts). Rust imports the structs,
-//! wraps the Java buffers, then immediately deep-copies every buffer into Rust-owned
-//! memory and drops the C structs. Dropping invokes the release callbacks, which hands
-//! the Java-side references back. After `import_batch` returns, Java may free everything.
+//! (zero-copy: Arrow Java only increments buffer refcounts). Rust imports the structs and
+//! wraps the Java buffers. In deep-copy mode (`copy == true`) every buffer is then copied
+//! into Rust-owned memory and the import is dropped, firing the release callbacks, so Java
+//! may free everything once `import_batch` returns. In zero-copy mode (`copy == false`) the
+//! import is kept in the returned batch, so the Java buffers stay alive until the table is
+//! dropped; Java must keep them unmodified until then (see `docs/arrow-lifetime.md`).
 //!
 //! Outbound (Rust -> Java): Rust writes an `FFI_ArrowSchema` (once, at query start) and
 //! one `FFI_ArrowArray` per column into Java-allocated struct memory. The exported

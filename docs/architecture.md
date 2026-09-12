@@ -109,9 +109,11 @@ One logical dataset → one RecordBatch per table. The bridge does not chop data
 shape like (decode source → Arrow builders → one RecordBatch). The sample benchmark
 models this with a single payment containing up to 2M transactions.
 
-The pipeline does not assume a single batch: `commitTable` builds a `MemTable` from
-`Vec<RecordBatch>`, and `stageArrow` can be called repeatedly to append batches before commit.
-Introducing multi-batch ingestion later requires no API change.
+The pipeline does not assume a single batch: `commitTable` builds a `MemTable` from a
+`Vec<RecordBatch>`, so the Rust side already models multiple batches per table. Today
+`stageArrow` stages exactly one batch per staged id (each call allocates a fresh id) and
+`commitTable` registers one staged id at a time; true multi-batch ingestion can be added
+later without an API change.
 
 ## Sample data model (test fixtures)
 
@@ -142,6 +144,12 @@ blobs, no flattening) so SQL like `WHERE debtor.account.iban = '…'` works nati
   thread while blocked — this is documented and accepted for v1 (correctness over async JNI).
 * Cancellation: `QueryResult.cancel()` aborts the query task; the next `next()` throws
   `QueryCancelledException`. Closing the engine cancels all live queries first.
+* **Results are not shareable across threads.** `QueryResult` is a single-consumer pull
+  stream (one thread may call `next()`) and each returned `VectorSchemaRoot` wraps native
+  memory with manual ownership (see `arrow-lifetime.md`); Arrow Java vectors are not
+  thread-safe. To process rows in parallel, materialize them into plain Java objects on the
+  consuming thread first, or deep-copy each batch into a per-worker root. Never close a
+  returned root while another thread is reading it.
 
 ## SQL safety
 

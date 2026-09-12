@@ -13,7 +13,7 @@ The invariant we must never break:
 
 `EngineConfig.zeroCopyIngest(boolean)` selects how `registerArrow` handles the Java buffers.
 
-| | **zero-copy** (default) | **deep-copy** (`zeroCopyIngest(false)`) |
+| | **deep-copy** (`zeroCopyIngest(false)`) | **zero-copy** (default) |
 |---|---|---|
 | What Rust gets | its own copy of every buffer | pointers into the Java buffers |
 | `load_into_datafusion` (1M rows) | ~5.0 s | ~0.09 s |
@@ -125,7 +125,7 @@ the memory lives until Rust releases it. What is *not* safe is **writing** to th
    memory before the table is dropped). The default zero-copy is correct for the
    build-once-then-query pipeline.
 
-## Deep-copy mode (default) ownership
+## Deep-copy mode ownership
 
 1. Java exports (retain, no copy) → Rust imports (wrap) → Rust `deep_copy` → drops the
    import, firing the release callback. Java's references are back before `registerArrow`

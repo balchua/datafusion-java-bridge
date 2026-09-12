@@ -59,4 +59,19 @@ class LifecycleTest {
             r.close(); // idempotent
         }
     }
+
+    @Test
+    void closingResultAfterEngineCloseIsSafe() {
+        BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+        DataFusionEngine engine = new DataFusionEngine(EngineConfig.defaults());
+        try (VectorSchemaRoot root = TestPayments.messageRoot("MSG-1", 1, allocator)) {
+            engine.registerArrow(PaymentSchemas.TABLE_MESSAGE, root);
+            QueryResult r = engine.query("SELECT count(*) AS n FROM payment_message");
+            engine.close();
+            r.close(); // engine already drained the query; must be a no-op, not throw
+        } finally {
+            engine.close(); // idempotent
+            allocator.close();
+        }
+    }
 }

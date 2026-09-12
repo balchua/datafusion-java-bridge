@@ -137,8 +137,18 @@ pub extern "system" fn Java_io_github_balchua_datafusion_engine_NativeEngine_eng
     // before freeing the Box.
     let engine = unsafe { &*(ptr as *const Engine) };
     engine.cancel_all_queries();
-    engine.wait_idle();
-    unsafe { drop(Box::from_raw(ptr as *mut Engine)) };
+    if engine.wait_idle() {
+        unsafe { drop(Box::from_raw(ptr as *mut Engine)) };
+    } else {
+        // A native call is still running after the deadline (e.g. a hung object-store
+        // operation in queryToParquet/registerParquet). Freeing the engine now would be
+        // a use-after-free in that call, so leak it instead. This only happens if a call
+        // genuinely never returns; leaking one engine is strictly safer than corrupting.
+        eprintln!(
+            "datafusion-java-bridge: engineClose timed out waiting for in-flight native \
+             calls; leaking the engine to avoid a use-after-free"
+        );
+    }
 }
 
 #[no_mangle]

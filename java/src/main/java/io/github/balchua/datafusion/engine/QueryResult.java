@@ -58,6 +58,15 @@ public final class QueryResult implements AutoCloseable {
         try (ArrowSchema schemaStruct = ArrowSchema.allocateNew(allocator)) {
             NativeEngine.resultSchema(engine.nativeHandle(), queryId, schemaStruct.memoryAddress());
             this.schema = Data.importSchema(allocator, schemaStruct, dictionaryProvider);
+        } catch (RuntimeException | Error e) {
+            // Constructor failure means the caller never gets a reference to close();
+            // free the allocator here. The native query is released by the caller.
+            try {
+                allocator.close();
+            } catch (RuntimeException closeFailure) {
+                e.addSuppressed(closeFailure);
+            }
+            throw e;
         }
         this.fields = schema.getFields();
     }
@@ -135,10 +144,16 @@ public final class QueryResult implements AutoCloseable {
     public void close() {
         if (!closed) {
             closed = true;
-            NativeEngine.resultClose(engine.nativeHandle(), queryId);
-            // Any imported vectors not closed by the caller are closed here via the
-            // allocator; the allocator itself must be free of children now.
-            allocator.close();
+            try {
+                NativeEngine.resultClose(engine.nativeHandle(), queryId);
+            } catch (EngineClosedException e) {
+                // The engine was closed and already drained/cancelled this query;
+                // closing the result afterwards is a valid teardown order.
+            } finally {
+                // Any imported vectors not closed by the caller are closed here via the
+                // allocator; the allocator itself must be free of children now.
+                allocator.close();
+            }
         }
     }
 }
