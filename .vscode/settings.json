@@ -1,0 +1,25 @@
+{
+  // Java: import the Maven module under java/ (the root pom.xml is an aggregator)
+  "java.configuration.updateBuildConfiguration": "automatic",
+  "java.import.maven.enabled": true,
+  "java.server.launchMode": "Standard",
+  // Make sure the Maven extension picks up the module pom under java/
+  "maven.pomfile.globPattern": "**/pom.xml",
+  // Java 21+ runtimes: used to compile/run the module (maven.compiler.release=21)
+  "java.configuration.runtimes": [
+    {
+      "name": "JavaSE-25",
+      "path": "/home/thor/apps/jdk-25.0.2+10/",
+      "default": true
+    }
+  ],
+  // Rust: point rust-analyzer at the cargo crate under rust/
+  "rust-analyzer.linkedProjects": [
+    "rust/Cargo.toml"
+  ],
+  // Silence build-output noise unrelated to the project
+  "files.watcherExclude": {
+    "**/target/**": true,
+    "**/rust/target/**": true
+  }
+}

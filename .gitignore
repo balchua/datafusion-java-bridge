@@ -1,0 +1,8 @@
+# Maven
+java/target/
+# Rust
+rust/target/
+# Benchmark outputs
+bench/*
+*.parquet
+/target/

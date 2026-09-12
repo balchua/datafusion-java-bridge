@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Aggregator POM. The buildable module lives in java/ (it owns the pom with all
+  dependencies and plugins); rust/ is a Cargo crate built via the exec-maven-plugin
+  binding declared there.
+
+  This file exists so that IDEs (VS Code Java + Maven extensions) and `mvn` invocations
+  from the project root resolve the module correctly:
+
+      mvn test            # delegates to java/pom.xml
+      mvn -pl java test   # same, explicit
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>io.github.balchua</groupId>
+  <artifactId>datafusion-java-bridge-root</artifactId>
+  <version>0.1.0</version>
+  <packaging>pom</packaging>
+  <name>datafusion-java-bridge (root aggregator)</name>
+
+  <modules>
+    <module>java</module>
+  </modules>
+</project>

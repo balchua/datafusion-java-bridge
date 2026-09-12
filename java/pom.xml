@@ -1,0 +1,140 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>io.github.balchua</groupId>
+  <artifactId>datafusion-java-bridge</artifactId>
+  <version>0.1.0</version>
+  <packaging>jar</packaging>
+  <name>datafusion-java-bridge</name>
+  <description>Java Arrow -> JNI -> Rust DataFusion SQL -> Arrow/Parquet</description>
+
+  <properties>
+    <maven.compiler.release>21</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <arrow.version>19.0.0</arrow.version>
+    <junit.version>5.11.4</junit.version>
+    <skipNative>false</skipNative>
+    <!-- large-data tests excluded by default; enabled with -Plarge -->
+    <excludedGroups>large</excludedGroups>
+    <dfe.native.library></dfe.native.library>
+  </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.junit</groupId>
+        <artifactId>junit-bom</artifactId>
+        <version>${junit.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <dependencies>
+    <!-- Apache Arrow Java: vector model, memory and the C Data Interface -->
+    <dependency>
+      <groupId>org.apache.arrow</groupId>
+      <artifactId>arrow-vector</artifactId>
+      <version>${arrow.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.arrow</groupId>
+      <artifactId>arrow-memory-unsafe</artifactId>
+      <version>${arrow.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.arrow</groupId>
+      <artifactId>arrow-c-data</artifactId>
+      <version>${arrow.version}</version>
+    </dependency>
+
+    <!-- Silences javac warnings about checkerframework annotations inside arrow jars -->
+    <dependency>
+      <groupId>org.checkerframework</groupId>
+      <artifactId>checker-qual</artifactId>
+      <version>3.49.0</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <directory>${project.basedir}/target</directory>
+
+    <plugins>
+      <!-- Build the Rust native library (rust/) as part of the Maven lifecycle so that
+           `mvn test` works out of the box. Skip with -DskipNative=true. -->
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>exec-maven-plugin</artifactId>
+        <version>3.5.0</version>
+        <executions>
+          <execution>
+            <id>build-native</id>
+            <phase>generate-resources</phase>
+            <goals>
+              <goal>exec</goal>
+            </goals>
+            <configuration>
+              <skip>${skipNative}</skip>
+              <executable>cargo</executable>
+              <workingDirectory>${project.basedir}/../rust</workingDirectory>
+              <arguments>
+                <argument>build</argument>
+                <argument>--release</argument>
+              </arguments>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.13.0</version>
+        <configuration>
+          <compilerArgs>
+            <arg>-Xlint:all</arg>
+          </compilerArgs>
+        </configuration>
+      </plugin>
+
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.2.5</version>
+        <configuration>
+          <argLine>
+            --enable-native-access=ALL-UNNAMED
+            --add-opens=java.base/java.nio=ALL-UNNAMED
+            -Dio.netty.tryReflectionSetAccessible=true
+          </argLine>
+          <excludedGroups>${excludedGroups}</excludedGroups>
+          <systemPropertyVariables>
+            <dfe.native.library>${dfe.native.library}</dfe.native.library>
+          </systemPropertyVariables>
+          <workingDirectory>${project.basedir}</workingDirectory>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+
+  <profiles>
+    <!-- Runs the large-data tests (100K / 1M rows): mvn test -Plarge -->
+    <profile>
+      <id>large</id>
+      <properties>
+        <excludedGroups></excludedGroups>
+      </properties>
+    </profile>
+  </profiles>
+</project>
