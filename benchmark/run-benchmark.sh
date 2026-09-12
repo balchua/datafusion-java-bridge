@@ -9,11 +9,17 @@
 # `java` runs the benchmark. The only JVM overhead present is the benchmark itself.
 #
 # The dataset shape (messages x remittances-per-message x transactions-per-remittance)
-# is mandatory. Usage examples:
+# is mandatory — except in pain.001 XML mode (--pain / --pain-xml). Usage examples:
 #   benchmark/run-benchmark.sh --messages 4 --remittances-per-message 10 \
 #       --transactions-per-remittance 2500 --out bench/results.json
 #   benchmark/run-benchmark.sh --messages 1 --remittances-per-message 80000 \
 #       --transactions-per-remittance 25 --out bench/results-2m.json
+#
+# pain.001 XML comparison: parse a real ISO 20022 file into Arrow and register it in
+# DataFusion. --pain generates/reuses Type A (1 PmtInf x 1,000,000 tx, 734 MB) under
+# bench/pain-xml; --pain-xml FILE uses your own file. The shape flags are ignored:
+#   DFE_JVM_OPTS="-Xmx6g" benchmark/run-benchmark.sh --pain --out bench/perf/pain-typeA.json
+#   benchmark/run-benchmark.sh --pain-xml /data/pain001.xml --out bench/perf/pain.json
 #
 # Extra JVM options (heap sizing etc.) can be passed via DFE_JVM_OPTS:
 #   DFE_JVM_OPTS="-Xmx16g" benchmark/run-benchmark.sh --messages 1 --remittances-per-message 80000
@@ -34,7 +40,7 @@ echo ">> assembling classpath via Maven (not used at benchmark runtime)"
 # target/test-classes that Maven's incremental compile then treats as up to date.
 mvn -q -pl java clean test-compile
 mvn -q -pl java dependency:copy-dependencies \
-    -DincludeScope=runtime \
+    -DincludeScope=test \
     -DoutputDirectory="$PWD/java/target/bench-libs" \
     -DskipTests=true
 

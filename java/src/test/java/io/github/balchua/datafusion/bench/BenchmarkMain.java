@@ -1,6 +1,7 @@
 package io.github.balchua.datafusion.bench;
 
 import io.github.balchua.datafusion.engine.EngineConfig;
+import io.github.balchua.datafusion.bench.pain.PainXmlBenchmark;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -45,6 +46,11 @@ public final class BenchmarkMain {
         try (MemoryMonitor monitor = new MemoryMonitor(100);
                 org.apache.arrow.memory.RootAllocator allocator = new org.apache.arrow.memory.RootAllocator(
                         Long.MAX_VALUE)) {
+            if (p.pain) {
+                PainXmlBenchmark.run(p.painXml != null ? Path.of(p.painXml) : null,
+                        out, p.engineConfig(), monitor);
+                return;
+            }
             BenchmarkRunner runner = new BenchmarkRunner(
                     allocator, p.engineConfig(), monitor);
 
@@ -153,6 +159,8 @@ public final class BenchmarkMain {
         String s3SecretKey;
         boolean s3AllowHttp;
         boolean help;
+        boolean pain; // pain.001 XML -> Arrow comparison mode
+        String painXml; // optional XML path; null = generate/reuse Type A (1M)
 
         SyntheticPaymentGenerator.Shape shape() {
             if (remittancesPerMessage <= 0) {
@@ -235,6 +243,11 @@ public final class BenchmarkMain {
                     case "--s3-access-key" -> p.s3AccessKey = args[++i];
                     case "--s3-secret-key" -> p.s3SecretKey = args[++i];
                     case "--s3-allow-http" -> p.s3AllowHttp = true;
+                    case "--pain" -> p.pain = true;
+                    case "--pain-xml" -> {
+                        p.pain = true;
+                        p.painXml = args[++i];
+                    }
                     case "--help" -> p.help = true;
                     default -> throw new IllegalArgumentException("unknown arg: " + args[i]);
                 }
@@ -266,6 +279,10 @@ public final class BenchmarkMain {
                                                                 q5 aggregation              GROUP BY currency, SUM(amount)
                                                                 q6 join                     message x remittance x transaction
                                                                 q7 validation report        per-remittance declared vs actual
+
+                          pain.001 XML comparison (separate run; ignores --messages etc.):
+                            --pain                              parse Type A pain.001 XML (1M) -> Arrow -> DataFusion
+                            --pain-xml FILE                     use FILE instead of generating/reusing Type A
 
                           Output / runtime:
                             --out FILE.json                     writes FILE.json and FILE.csv (default bench/results.json)
