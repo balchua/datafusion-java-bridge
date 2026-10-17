@@ -41,6 +41,7 @@ public final class DataFusionEngine implements AutoCloseable {
     private final String versionInfo;
 
     public DataFusionEngine(EngineConfig config) {
+        Objects.requireNonNull(config, "config");
         long created = NativeEngine.engineCreate(config.toNativeJson());
         if (created == 0) {
             throw new DataFusionException(
@@ -78,11 +79,13 @@ public final class DataFusionEngine implements AutoCloseable {
     }
 
     /**
-     * Registers one Arrow record batch as a table (canonical model: one payment ->
-     * one RecordBatch per table). The root is not modified; after this call
-     * returns,
-     * Java may close it immediately — the data has been copied into Rust-owned
-     * memory.
+     * Registers one Arrow record batch as a table (canonical model: one payment -> one
+     * RecordBatch per table). The root is not modified. With the default <b>zero-copy</b>
+     * ingest the Rust side wraps the Java buffers, so the root must stay alive and
+     * unmodified until the engine is closed (closing the Java root immediately is still
+     * safe — Arrow retains the buffers). With {@link EngineConfig.Builder#zeroCopyIngest
+     * deep-copy} ingest Rust owns a copy and Java may reclaim its buffers at once.
+     * See docs/arrow-lifetime.md.
      */
     public void registerArrow(String tableName, VectorSchemaRoot batch) {
         Objects.requireNonNull(tableName, "tableName");
@@ -134,6 +137,7 @@ public final class DataFusionEngine implements AutoCloseable {
     /** Executes a SELECT query; results stream as Arrow batches. */
     @SuppressWarnings("java:S2093") // the native query is released only on construction failure
     public QueryResult query(String sql) {
+        Objects.requireNonNull(sql, "sql");
         ensureOpen();
         long queryId = NativeEngine.query(handle, sql);
         if (queryId == 0) {
@@ -145,7 +149,11 @@ public final class DataFusionEngine implements AutoCloseable {
         } catch (RuntimeException e) {
             // The native query is already registered; if the Java wrapper cannot be
             // constructed, release it so it does not leak until engine.close().
-            NativeEngine.resultClose(handle, queryId);
+            try {
+                NativeEngine.resultClose(handle, queryId);
+            } catch (RuntimeException closeFailure) {
+                e.addSuppressed(closeFailure);
+            }
             throw e;
         }
     }
@@ -156,26 +164,37 @@ public final class DataFusionEngine implements AutoCloseable {
      * @return JSON {"encode_nanos":..,"publish_nanos":..} for benchmarking.
      */
     public String queryToParquet(String sql, String destination) {
+        Objects.requireNonNull(sql, "sql");
+        Objects.requireNonNull(destination, "destination");
         ensureOpen();
         return NativeEngine.queryToParquet(handle, sql, destination);
     }
 
     /**
-     * Releases the engine, all registered tables, and all running queries. Any
-     * in-flight
-     * native calls are cancelled; their Java threads observe an
-     * EngineClosedException.
+     * Releases the engine, all registered tables, and all running queries.
+     *
+     * <p>In-flight native calls are cancelled; their Java threads observe an
+     * {@link EngineClosedException}. Close waits up to
+     * {@link EngineConfig.Builder#closeTimeoutMillis} for those calls to return; if one is
+     * still running after the deadline, the engine is <b>not freed</b> — it is released
+     * when that call finishes (a bounded leak rather than a use-after-free). A value of
+     * {@code 0} waits forever. Idempotent.
      */
     @Override
     public void close() {
         if (closed.compareAndSet(false, true)) {
-            NativeEngine.engineClose(handle);
-            structAllocator.close();
+            try {
+                NativeEngine.engineClose(handle);
+            } finally {
+                // Unconditional: a native failure must not strand the struct allocator,
+                // since the CAS above means close() will never run again.
+                structAllocator.close();
+            }
         }
     }
 
-    /** Native handle; exposed for tests and the benchmark harness. */
-    public long nativeHandle() {
+    /** Native handle; package-private. Tests reach it through the test-only seam. */
+    long nativeHandle() {
         return handle;
     }
 

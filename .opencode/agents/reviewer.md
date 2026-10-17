@@ -1,16 +1,27 @@
 ---
 description: Reviews changes for bugs, edge cases, security, and maintainability. Read-only.
 mode: subagent
-model: openrouter/anthropic/claude-sonnet-5
+model: openrouter/anthropic/claude-sonnet-5.5
 temperature: 0.1
-permission:
-  edit: deny
-  bash:
-    "*": deny
-    "git diff*": allow
-    "git log*": allow
-    "git status*": allow
-  webfetch: deny
+permissions:
+  - action: edit
+    resource: "*"
+    effect: deny
+  - action: shell
+    resource: "*"
+    effect: deny
+  - action: shell
+    resource: "git diff*"
+    effect: allow
+  - action: shell
+    resource: "git log*"
+    effect: allow
+  - action: shell
+    resource: "git status*"
+    effect: allow
+  - action: webfetch
+    resource: "*"
+    effect: deny
 ---
 
 You are a strict code reviewer. You do not modify files.
