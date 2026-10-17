@@ -1,29 +1,58 @@
 //! JNI entry points. This is the only module that touches the JVM directly.
 //!
 //! Conventions:
-//! * Errors: any `EngineError` is thrown as the Java exception returned by
-//!   `EngineError::java_class()` and the native method returns a sentinel
-//!   (`0` for handles, `-2` for row counts) with the exception pending.
-//! * Engine handles are `i64` holding `Box<Engine>` raw pointers. A global registry
-//!   validates every handle so a stale or garbage pointer throws instead of crashing.
-//! * Query ids are engine-local `u64` counters validated through the engine's registry,
-//!   so the result methods take `(engineHandle, queryId)`.
+//! * Every entry point body runs inside [`run`], which catches panics and throws any
+//!   `EngineError` as the Java exception returned by `EngineError::java_class()`, then
+//!   returns the function's sentinel value (`0` for handles, `-2` for row counts). Without
+//!   this, a Rust panic would unwind across the `extern "system"` boundary and abort the JVM.
+//! * Engine handles are opaque, never-reused `u64` ids validated through a global registry,
+//!   so a stale or garbage pointer throws instead of crashing.
+//! * Query ids are engine-local `u64` counters validated through the engine's registry, so
+//!   the result methods take `(engineHandle, queryId)`.
 
 use jni::objects::{JClass, JLongArray, JString};
 use jni::sys::jlong;
 use jni::JNIEnv;
-use std::collections::HashSet;
-use std::sync::{LazyLock, Mutex};
+use std::collections::HashMap;
+use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use crate::engine::{ActiveCall, Engine};
 use crate::error::{EngineError, ErrorKind, Result};
 
-/// Registry of live engine handles. An engine is inserted on `engineCreate` and removed
-/// in `engineClose` before the `Box` is dropped, so a validated pointer is always alive.
-static ENGINES: LazyLock<Mutex<HashSet<usize>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+/// Registry of live engines, keyed by an opaque, never-reused id. Ids are handed to Java as
+/// `jlong` handles; the raw pointer is never exposed, so a stale handle cannot be confused
+/// with a later engine that happens to reuse the same address (ABA).
+static ENGINES: LazyLock<Mutex<HashMap<u64, Arc<Engine>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Source of engine ids. Starts at 1 so 0 can never be a valid handle.
+static NEXT_ENGINE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Upper bound on live engines, so a caller cannot spawn unbounded runtimes/threads.
+const MAX_ENGINES: usize = 1024;
 
 const ENGINE_CLOSED: &str = "engine is closed or the handle is invalid";
+const SENTINEL_HANDLE: jlong = 0; // handle-returning methods: error thrown
 const SENTINEL_ERROR: jlong = -2; // row-count methods: error thrown
+const END_OF_STREAM: jlong = -1; // row-count methods: clean end of stream
+
+fn next_engine_id() -> u64 {
+    NEXT_ENGINE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Locks the engine registry, recovering from a poisoned mutex.
+///
+/// The guarded value is a `HashMap` with no cross-entry invariant, so a panic mid-section
+/// cannot leave it dangerously inconsistent. Recovering means a single bad call fails
+/// instead of bricking every engine in the process (the registry lock is shared by all
+/// engines).
+fn engines() -> std::sync::MutexGuard<'static, HashMap<u64, Arc<Engine>>> {
+    ENGINES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -33,27 +62,69 @@ fn closed_error() -> EngineError {
     EngineError::new(ErrorKind::EngineClosed, ENGINE_CLOSED)
 }
 
-/// # Safety
+/// Converts a caught panic payload into a Java-visible internal error.
+fn panic_error(payload: &(dyn std::any::Any + Send)) -> EngineError {
+    let message = if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    };
+    EngineError::new(ErrorKind::Internal, format!("native panic: {message}"))
+}
+
+/// Runs a JNI entry-point body, turning a panic or an `Err` into a thrown Java exception.
 ///
-/// `handle` must be a value previously returned by `engineCreate` that has not been
-/// passed to `engineClose` yet. The registry guarantees the pointer is a live
-/// `Box<Engine>`; dereferencing is safe because close removes the pointer from the
-/// registry (under the same mutex) before freeing it. If the invariant is violated
-/// (e.g. a forged handle), the registry check fails and an error is returned instead
-/// of a dangling dereference.
-fn engine_from(handle: jlong) -> Result<(ActiveCall, &'static Engine)> {
-    // The registry lock serializes entry against engineClose: either the handle is
-    // still registered and we increment `active_calls` before releasing the lock, or
-    // it was already removed and we return an error. There is no window in between.
-    let engines = ENGINES.lock().unwrap();
-    let ptr = handle as usize;
-    if ptr == 0 || !engines.contains(&ptr) {
-        return Err(closed_error());
+/// On success the body's value is returned; on failure `default` is returned with the Java
+/// exception pending. This is the single place that catches panics and throws, so a panic
+/// can never unwind across the `extern "system"` boundary (which would abort the JVM).
+fn run<'local, T>(
+    env: &mut JNIEnv<'local>,
+    default: T,
+    f: impl FnOnce(&mut JNIEnv<'local>) -> Result<T>,
+) -> T {
+    // SAFETY: the body runs to completion before `env` is reborrowed for throwing, and the
+    // JNI env is only used on this thread, so there is no aliasing or cross-thread use.
+    let env_ptr: *mut JNIEnv<'local> = env;
+    let outcome =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { f(&mut *env_ptr) }));
+    match outcome {
+        Ok(Ok(value)) => value,
+        Ok(Err(err)) => {
+            throw_unless_pending(unsafe { &mut *env_ptr }, &err);
+            default
+        }
+        Err(payload) => {
+            let err = panic_error(&*payload);
+            throw_unless_pending(unsafe { &mut *env_ptr }, &err);
+            default
+        }
     }
-    // SAFETY: see function documentation.
-    let engine = unsafe { &*(ptr as *const Engine) };
-    engine.active_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    Ok((ActiveCall::new(engine), engine))
+}
+
+/// Throws `err` unless a Java exception is already pending (throwing while one is pending
+/// is invalid JNI; the pending exception is the more precise one).
+fn throw_unless_pending(env: &mut JNIEnv, err: &EngineError) {
+    if env.exception_check().unwrap_or(false) {
+        return;
+    }
+    throw(env, err);
+}
+
+/// # Safety invariant
+///
+/// `handle` must be a value previously returned by `engineCreate` that has not been passed
+/// to `engineClose`. The registry guarantees the id maps to a live engine; the returned
+/// `Arc` keeps it alive for the duration of the call, and `active_calls` is incremented
+/// under the registry lock so `engineClose`'s `wait_idle` sees in-flight calls.
+fn engine_from(handle: jlong) -> Result<(ActiveCall, Arc<Engine>)> {
+    let registry = engines();
+    let engine = registry
+        .get(&(handle as u64))
+        .cloned()
+        .ok_or_else(closed_error)?;
+    Ok((ActiveCall::new(Arc::clone(&engine)), engine))
 }
 
 fn get_string(env: &mut JNIEnv, s: &JString) -> Result<String> {
@@ -66,6 +137,22 @@ fn get_addresses(env: &mut JNIEnv, arr: &JLongArray) -> Result<Vec<usize>> {
     let len = env
         .get_array_length(arr)
         .map_err(|e| EngineError::new(ErrorKind::Internal, format!("jni array length: {e}")))?;
+    if len < 0 {
+        // A negative length would overflow the `Vec` capacity below and panic.
+        return Err(EngineError::new(
+            ErrorKind::Internal,
+            format!("negative JNI array length: {len}"),
+        ));
+    }
+    // Defense in depth: these arrays hold one entry per result column; a huge length would
+    // attempt a correspondingly large allocation.
+    const MAX_LEN: i32 = 65_536;
+    if len > MAX_LEN {
+        return Err(EngineError::new(
+            ErrorKind::Internal,
+            format!("implausible JNI array length: {len}"),
+        ));
+    }
     let mut longs = vec![0i64; len as usize];
     env.get_long_array_region(arr, 0, &mut longs)
         .map_err(|e| EngineError::new(ErrorKind::Internal, format!("jni array access: {e}")))?;
@@ -73,20 +160,13 @@ fn get_addresses(env: &mut JNIEnv, arr: &JLongArray) -> Result<Vec<usize>> {
 }
 
 fn throw(env: &mut JNIEnv, err: &EngineError) {
-    let _ = env.throw_new(err.java_class(), err.to_string());
-}
-
-fn throw_msg(env: &mut JNIEnv, err: &EngineError) {
+    // The Java exception class already encodes the kind, so throw the bare message.
     let _ = env.throw_new(err.java_class(), &err.message);
 }
 
-fn new_string<'local>(
-    env: &mut JNIEnv<'local>,
-    value: &str,
-) -> Result<JString<'local>> {
-    env.new_string(value).map_err(|e| {
-        EngineError::new(ErrorKind::Internal, format!("jni new string: {e}"))
-    })
+fn new_string<'local>(env: &mut JNIEnv<'local>, value: &str) -> Result<JString<'local>> {
+    env.new_string(value)
+        .map_err(|e| EngineError::new(ErrorKind::Internal, format!("jni new string: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -99,24 +179,27 @@ pub extern "system" fn Java_io_github_balchua_datafusion_engine_NativeEngine_eng
     _class: JClass,
     config_json: JString,
 ) -> jlong {
-    let config = match get_string(&mut env, &config_json) {
-        Ok(c) => c,
-        Err(e) => {
-            throw_msg(&mut env, &e);
-            return 0;
+    run(&mut env, SENTINEL_HANDLE, |env| {
+        let config = get_string(env, &config_json)?;
+        // Cheap pre-check so a rejected create does not build and tear down a runtime.
+        if engines().len() >= MAX_ENGINES {
+            return Err(EngineError::new(
+                ErrorKind::Resource,
+                format!("too many live engines (max {MAX_ENGINES})"),
+            ));
         }
-    };
-    match Engine::create(&config) {
-        Ok(engine) => {
-            let ptr = Box::into_raw(Box::new(engine)) as usize;
-            ENGINES.lock().unwrap().insert(ptr);
-            ptr as jlong
+        let engine = Engine::create(&config)?;
+        let mut registry = engines();
+        if registry.len() >= MAX_ENGINES {
+            return Err(EngineError::new(
+                ErrorKind::Resource,
+                format!("too many live engines (max {MAX_ENGINES})"),
+            ));
         }
-        Err(e) => {
-            throw(&mut env, &e);
-            0
-        }
-    }
+        let id = next_engine_id();
+        registry.insert(id, Arc::new(engine));
+        Ok(id as jlong)
+    })
 }
 
 #[no_mangle]
@@ -125,31 +208,26 @@ pub extern "system" fn Java_io_github_balchua_datafusion_engine_NativeEngine_eng
     _class: JClass,
     handle: jlong,
 ) {
-    let ptr = handle as usize;
-    // Remove from the registry first: after this, no other thread can enter the engine.
-    if !ENGINES.lock().unwrap().remove(&ptr) {
-        throw(&mut env, &closed_error());
-        return;
-    }
-    // SAFETY: the pointer was created by `Box::into_raw(Box<Engine>)` in `engineCreate`
-    // and removed from the registry above, so exactly one close can reclaim it. In-flight
-    // calls hold `active_calls > 0`; we cancel their queries and wait for them to return
-    // before freeing the Box.
-    let engine = unsafe { &*(ptr as *const Engine) };
-    engine.cancel_all_queries();
-    engine.cancel_all_operations();
-    if engine.wait_idle() {
-        unsafe { drop(Box::from_raw(ptr as *mut Engine)) };
-    } else {
-        // A native call is still running after the deadline (e.g. a hung object-store
-        // operation in queryToParquet/registerParquet). Freeing the engine now would be
-        // a use-after-free in that call, so leak it instead. This only happens if a call
-        // genuinely never returns; leaking one engine is strictly safer than corrupting.
-        eprintln!(
-            "datafusion-java-bridge: engineClose timed out waiting for in-flight native \
-             calls; leaking the engine to avoid a use-after-free"
-        );
-    }
+    run(&mut env, (), |_env| {
+        // Remove from the registry first: after this no new call can enter, and the engine
+        // is freed once the last in-flight call drops its `Arc` reference.
+        let engine = match engines().remove(&(handle as u64)) {
+            Some(e) => e,
+            None => return Err(closed_error()),
+        };
+        engine.cancel_all_queries();
+        engine.cancel_all_operations();
+        if !engine.wait_idle() {
+            // An in-flight call outlived the deadline; it holds its own `Arc`, so the engine
+            // is freed when that call finishes — no use-after-free, no leak.
+            let _ = writeln!(
+                std::io::stderr(),
+                "datafusion-java-bridge: engineClose timed out waiting for in-flight native \
+                 calls; the engine will be released when they finish"
+            );
+        }
+        Ok(())
+    })
 }
 
 #[no_mangle]
@@ -159,13 +237,9 @@ pub extern "system" fn Java_io_github_balchua_datafusion_engine_NativeEngine_eng
     mut env: JNIEnv<'local>,
     _class: JClass,
 ) -> JString<'local> {
-    match new_string(&mut env, &Engine::version()) {
-        Ok(s) => s,
-        Err(e) => {
-            throw_msg(&mut env, &e);
-            JString::default()
-        }
-    }
+    run(&mut env, JString::default(), |env| {
+        new_string(env, &Engine::version())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -181,34 +255,12 @@ pub extern "system" fn Java_io_github_balchua_datafusion_engine_NativeEngine_sta
     schema_addr: jlong,
     array_addrs: JLongArray,
 ) -> jlong {
-    let (_guard, engine) = match engine_from(handle) {
-        Ok(pair) => pair,
-        Err(e) => {
-            throw(&mut env, &e);
-            return 0;
-        }
-    };
-    let table = match get_string(&mut env, &table_name) {
-        Ok(t) => t,
-        Err(e) => {
-            throw_msg(&mut env, &e);
-            return 0;
-        }
-    };
-    let addrs = match get_addresses(&mut env, &array_addrs) {
-        Ok(a) => a,
-        Err(e) => {
-            throw_msg(&mut env, &e);
-            return 0;
-        }
-    };
-    match engine.stage_arrow(&table, schema_addr as usize, &addrs) {
-        Ok(id) => id as jlong,
-        Err(e) => {
-            throw(&mut env, &e);
-            0
-        }
-    }
+    run(&mut env, SENTINEL_HANDLE, |env| {
+        let (_guard, engine) = engine_from(handle)?;
+        let table = get_string(env, &table_name)?;
+        let addrs = get_addresses(env, &array_addrs)?;
+        Ok(engine.stage_arrow(&table, schema_addr as usize, &addrs)? as jlong)
+    })
 }
 
 #[no_mangle]
@@ -219,23 +271,11 @@ pub extern "system" fn Java_io_github_balchua_datafusion_engine_NativeEngine_com
     table_name: JString,
     staged_id: jlong,
 ) {
-    let (_guard, engine) = match engine_from(handle) {
-        Ok(pair) => pair,
-        Err(e) => {
-            throw(&mut env, &e);
-            return;
-        }
-    };
-    let table = match get_string(&mut env, &table_name) {
-        Ok(t) => t,
-        Err(e) => {
-            throw_msg(&mut env, &e);
-            return;
-        }
-    };
-    if let Err(e) = engine.commit_table(&table, staged_id as u64) {
-        throw(&mut env, &e);
-    }
+    run(&mut env, (), |env| {
+        let (_guard, engine) = engine_from(handle)?;
+        let table = get_string(env, &table_name)?;
+        engine.commit_table(&table, staged_id as u64)
+    })
 }
 
 #[no_mangle]
@@ -246,30 +286,12 @@ pub extern "system" fn Java_io_github_balchua_datafusion_engine_NativeEngine_reg
     table_name: JString,
     location: JString,
 ) {
-    let (_guard, engine) = match engine_from(handle) {
-        Ok(pair) => pair,
-        Err(e) => {
-            throw(&mut env, &e);
-            return;
-        }
-    };
-    let table = match get_string(&mut env, &table_name) {
-        Ok(t) => t,
-        Err(e) => {
-            throw_msg(&mut env, &e);
-            return;
-        }
-    };
-    let location = match get_string(&mut env, &location) {
-        Ok(l) => l,
-        Err(e) => {
-            throw_msg(&mut env, &e);
-            return;
-        }
-    };
-    if let Err(e) = engine.register_parquet(&table, &location) {
-        throw(&mut env, &e);
-    }
+    run(&mut env, (), |env| {
+        let (_guard, engine) = engine_from(handle)?;
+        let table = get_string(env, &table_name)?;
+        let location = get_string(env, &location)?;
+        engine.register_parquet(&table, &location)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -283,27 +305,11 @@ pub extern "system" fn Java_io_github_balchua_datafusion_engine_NativeEngine_que
     handle: jlong,
     sql: JString,
 ) -> jlong {
-    let (_guard, engine) = match engine_from(handle) {
-        Ok(pair) => pair,
-        Err(e) => {
-            throw(&mut env, &e);
-            return 0;
-        }
-    };
-    let sql = match get_string(&mut env, &sql) {
-        Ok(s) => s,
-        Err(e) => {
-            throw_msg(&mut env, &e);
-            return 0;
-        }
-    };
-    match engine.query(&sql) {
-        Ok(id) => id as jlong,
-        Err(e) => {
-            throw(&mut env, &e);
-            0
-        }
-    }
+    run(&mut env, SENTINEL_HANDLE, |env| {
+        let (_guard, engine) = engine_from(handle)?;
+        let sql = get_string(env, &sql)?;
+        Ok(engine.query(&sql)? as jlong)
+    })
 }
 
 #[no_mangle]
@@ -314,16 +320,10 @@ pub extern "system" fn Java_io_github_balchua_datafusion_engine_NativeEngine_res
     query_id: jlong,
     schema_addr: jlong,
 ) {
-    let (_guard, engine) = match engine_from(handle) {
-        Ok(pair) => pair,
-        Err(e) => {
-            throw(&mut env, &e);
-            return;
-        }
-    };
-    if let Err(e) = engine.result_schema(query_id as u64, schema_addr as usize) {
-        throw(&mut env, &e);
-    }
+    run(&mut env, (), |_env| {
+        let (_guard, engine) = engine_from(handle)?;
+        engine.result_schema(query_id as u64, schema_addr as usize)
+    })
 }
 
 /// Returns the number of rows in the next batch (>= 0), `-1` at end of stream, or `-2`
@@ -336,28 +336,14 @@ pub extern "system" fn Java_io_github_balchua_datafusion_engine_NativeEngine_res
     query_id: jlong,
     array_addrs: JLongArray,
 ) -> jlong {
-    let (_guard, engine) = match engine_from(handle) {
-        Ok(pair) => pair,
-        Err(e) => {
-            throw(&mut env, &e);
-            return SENTINEL_ERROR;
+    run(&mut env, SENTINEL_ERROR, |env| {
+        let (_guard, engine) = engine_from(handle)?;
+        let addrs = get_addresses(env, &array_addrs)?;
+        match engine.result_next(query_id as u64, &addrs)? {
+            Some(rows) => Ok(rows as jlong),
+            None => Ok(END_OF_STREAM),
         }
-    };
-    let addrs = match get_addresses(&mut env, &array_addrs) {
-        Ok(a) => a,
-        Err(e) => {
-            throw_msg(&mut env, &e);
-            return SENTINEL_ERROR;
-        }
-    };
-    match engine.result_next(query_id as u64, &addrs) {
-        Ok(Some(rows)) => rows as jlong,
-        Ok(None) => -1,
-        Err(e) => {
-            throw(&mut env, &e);
-            SENTINEL_ERROR
-        }
-    }
+    })
 }
 
 #[no_mangle]
@@ -367,41 +353,30 @@ pub extern "system" fn Java_io_github_balchua_datafusion_engine_NativeEngine_res
     handle: jlong,
     query_id: jlong,
 ) {
-    let (_guard, engine) = match engine_from(handle) {
-        Ok(pair) => pair,
-        Err(e) => {
-            throw(&mut env, &e);
-            return;
-        }
-    };
-    if let Err(e) = engine.result_cancel(query_id as u64) {
-        throw(&mut env, &e);
-    }
+    run(&mut env, (), |_env| {
+        let (_guard, engine) = match engine_from(handle) {
+            Ok(pair) => pair,
+            // Cancelling after the engine closed is a valid teardown order; a watchdog
+            // thread must not observe an exception for a query that is already gone.
+            Err(e) if e.kind == ErrorKind::EngineClosed => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        engine.result_cancel(query_id as u64)
+    })
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_github_balchua_datafusion_engine_NativeEngine_resultStats<
-    'local,
->(
+pub extern "system" fn Java_io_github_balchua_datafusion_engine_NativeEngine_resultStats<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass,
     handle: jlong,
     query_id: jlong,
 ) -> JString<'local> {
-    let (_guard, engine) = match engine_from(handle) {
-        Ok(pair) => pair,
-        Err(e) => {
-            throw(&mut env, &e);
-            return JString::default();
-        }
-    };
-    match engine.result_stats(query_id as u64).and_then(|s| new_string(&mut env, &s)) {
-        Ok(s) => s,
-        Err(e) => {
-            throw_msg(&mut env, &e);
-            JString::default()
-        }
-    }
+    run(&mut env, JString::default(), |env| {
+        let (_guard, engine) = engine_from(handle)?;
+        let stats = engine.result_stats(query_id as u64)?;
+        new_string(env, &stats)
+    })
 }
 
 #[no_mangle]
@@ -411,19 +386,15 @@ pub extern "system" fn Java_io_github_balchua_datafusion_engine_NativeEngine_res
     handle: jlong,
     query_id: jlong,
 ) {
-    let (_guard, engine) = match engine_from(handle) {
-        Ok(pair) => pair,
-        // Closing a result after its engine was closed is a valid teardown order: the
-        // engine already drained the query, so this is a no-op rather than an error.
-        Err(e) if e.kind == ErrorKind::EngineClosed => return,
-        Err(e) => {
-            throw(&mut env, &e);
-            return;
-        }
-    };
-    if let Err(e) = engine.close_result(query_id as u64) {
-        throw(&mut env, &e);
-    }
+    run(&mut env, (), |_env| {
+        let (_guard, engine) = match engine_from(handle) {
+            Ok(pair) => pair,
+            // Closing a result after its engine was closed is a valid teardown order.
+            Err(e) if e.kind == ErrorKind::EngineClosed => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        engine.close_result(query_id as u64)
+    })
 }
 
 /// Returns a JSON stats string: {"encode_nanos":..,"publish_nanos":..}
@@ -437,41 +408,34 @@ pub extern "system" fn Java_io_github_balchua_datafusion_engine_NativeEngine_que
     sql: JString,
     destination: JString,
 ) -> JString<'local> {
-    let (_guard, engine) = match engine_from(handle) {
-        Ok(pair) => pair,
-        Err(e) => {
-            throw(&mut env, &e);
-            return JString::default();
+    run(&mut env, JString::default(), |env| {
+        let (_guard, engine) = engine_from(handle)?;
+        let sql = get_string(env, &sql)?;
+        let destination = get_string(env, &destination)?;
+        let (encode_ns, publish_ns) = engine.query_to_parquet(&sql, &destination)?;
+        let json = format!(
+            r#"{{"encode_nanos":{},"publish_nanos":{}}}"#,
+            encode_ns, publish_ns
+        );
+        new_string(env, &json)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_handle_is_rejected() {
+        match engine_from(0) {
+            Err(e) => assert_eq!(e.kind, ErrorKind::EngineClosed),
+            Ok(_) => panic!("a zero handle must be rejected"),
         }
-    };
-    let sql = match get_string(&mut env, &sql) {
-        Ok(s) => s,
-        Err(e) => {
-            throw_msg(&mut env, &e);
-            return JString::default();
-        }
-    };
-    let destination = match get_string(&mut env, &destination) {
-        Ok(d) => d,
-        Err(e) => {
-            throw_msg(&mut env, &e);
-            return JString::default();
-        }
-    };
-    match engine.query_to_parquet(&sql, &destination) {
-        Ok((encode_ns, publish_ns)) => {
-            let json = format!(r#"{{"encode_nanos":{},"publish_nanos":{}}}"#, encode_ns, publish_ns);
-            match new_string(&mut env, &json) {
-                Ok(s) => s,
-                Err(e) => {
-                    throw_msg(&mut env, &e);
-                    JString::default()
-                }
-            }
-        }
-        Err(e) => {
-            throw(&mut env, &e);
-            JString::default()
-        }
+    }
+
+    #[test]
+    fn panic_error_extracts_the_message() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("boom");
+        assert!(panic_error(&*payload).message.contains("boom"));
     }
 }

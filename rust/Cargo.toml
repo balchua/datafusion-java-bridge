@@ -2,6 +2,8 @@
 name = "datafusion_java_bridge"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.94"
+publish = false
 description = "JNI bridge: Java Arrow -> DataFusion SQL -> Arrow/Parquet"
 
 [lib]
@@ -10,13 +12,14 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 datafusion = "55.1.0"
-# Explicit so the Arrow C Data Interface (`ffi` feature) is enabled on the SAME
-# single arrow build that DataFusion uses (feature unification, same 59.3.0).
+# `ffi` enables the Arrow C Data Interface. Cargo's resolver unifies this with
+# DataFusion's own `arrow` dependency into one build; `Cargo.lock` (committed) pins the
+# exact version, so this manifest range is not what guarantees a single shared build.
 arrow = { version = "59.3.0", features = ["ffi"] }
 object_store = { version = "0.13.2", features = ["aws"] }
 jni = "0.21.1"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "fs", "io-util"] }
+tokio-util = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 url = "2"

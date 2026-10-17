@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 use crate::error::{EngineError, ErrorKind, Result};
+use crate::sync::MutexExt;
 
 /// Capacity of the channel between the producer task and Java. Small on purpose:
 /// bounds memory in flight and keeps producer/consumer paces coupled.
@@ -50,20 +51,25 @@ impl QueryHandle {
         let weak = Arc::downgrade(&handle);
         let join = rt.spawn(async move {
             let started = std::time::Instant::now();
+            let mut errored = false;
             match datafusion::physical_plan::execute_stream(plan, task_ctx) {
                 Ok(mut stream) => {
                     while let Some(next) = stream.next().await {
                         match next {
                             Ok(batch) => {
-                                let producer_gone = weak.upgrade().is_none();
-                                if producer_gone {
-                                    break; // Java dropped the result: stop producing
-                                }
+                                match weak.upgrade() {
+                                    Some(inner) => inner
+                                        .produced_rows
+                                        .fetch_add(batch.num_rows() as u64, Ordering::Relaxed),
+                                    // Java dropped the result: stop producing.
+                                    None => break,
+                                };
                                 if tx.send(Ok(batch)).await.is_err() {
                                     break;
                                 }
                             }
                             Err(e) => {
+                                errored = true;
                                 let _ = tx.send(Err(e.into())).await;
                                 break;
                             }
@@ -71,6 +77,7 @@ impl QueryHandle {
                     }
                 }
                 Err(e) => {
+                    errored = true;
                     let _ = tx.send(Err(e.into())).await;
                 }
             }
@@ -78,18 +85,22 @@ impl QueryHandle {
                 inner
                     .produce_nanos
                     .store(started.elapsed().as_nanos() as u64, Ordering::Release);
-                inner.finished.store(true, Ordering::Release);
+                // Do not mark finished after an error: a retry must see the error, not a
+                // clean end-of-stream.
+                if !errored {
+                    inner.finished.store(true, Ordering::Release);
+                }
             }
             drop(tx); // close the channel -> Java sees end-of-stream
         });
-        *handle.join.lock().unwrap() = Some(join);
+        *handle.join.lock_or_recover() = Some(join);
         handle
     }
 
     /// Blocking receive of the next batch. Returns `None` at end of stream.
     /// Must be called from a non-async (JNI) thread.
     pub fn next(&self) -> Result<Option<RecordBatch>> {
-        let mut rx = self.rx.lock().unwrap();
+        let mut rx = self.rx.lock_or_recover();
         match rx.blocking_recv() {
             Some(Ok(batch)) => Ok(Some(batch)),
             Some(Err(e)) => {
@@ -98,13 +109,22 @@ impl QueryHandle {
                 Err(e)
             }
             None => {
-                if self.cancelled.load(Ordering::SeqCst) {
+                // Finished first: a late cancel() after the stream was fully drained must
+                // not turn a clean end-of-stream into a Cancelled error.
+                if self.finished.load(Ordering::Acquire) {
+                    Ok(None)
+                } else if self.cancelled.load(Ordering::SeqCst) {
                     Err(EngineError::new(
                         ErrorKind::Cancelled,
                         "query was cancelled",
                     ))
                 } else {
-                    Ok(None)
+                    // The channel closed but the producer never signalled completion: the
+                    // producer task panicked. Surface it rather than truncating silently.
+                    Err(EngineError::new(
+                        ErrorKind::Internal,
+                        "query producer terminated unexpectedly",
+                    ))
                 }
             }
         }
@@ -114,7 +134,7 @@ impl QueryHandle {
     /// (or end-of-stream if it had already finished).
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
-        if let Some(join) = self.join.lock().unwrap().take() {
+        if let Some(join) = self.join.lock_or_recover().take() {
             join.abort();
         }
     }

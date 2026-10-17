@@ -158,16 +158,22 @@ blobs, no flattening) so SQL like `WHERE debtor.account.iban = '…'` works nati
 
 ## SQL safety
 
-`sql_guard.rs` parses the SQL with DataFusion's own parser (`DFParser`) and accepts only
-`Statement::Query`. `COPY`, `CREATE EXTERNAL TABLE`, `INSERT/UPDATE/DELETE`, `SET`, DDL and
-multi-statements are rejected before reaching DataFusion. Only explicitly registered tables are
-visible; there are no SQL functions in this build that touch the filesystem or network.
-Parameterized queries are not supported in v1 (documented limitation).
+`sql_guard.rs` parses the SQL with DataFusion's own parser (`DFParser`) and accepts only a
+single `Statement::Query`, rejecting `SELECT ... INTO`, `COPY`, `CREATE EXTERNAL TABLE`,
+`INSERT/UPDATE/DELETE`, `SET`, DDL and multi-statements before reaching DataFusion. Only
+explicitly registered tables are visible; there are no SQL functions in this build that touch
+the filesystem or network. Parameterized queries are not supported in v1 (documented
+limitation).
 
 ## Error handling
 
 `error.rs` defines one Rust enum `EngineError` with a `kind`; the JNI layer throws the matching
 Java exception class (`SqlParseException`, `SqlUnsupportedException`, `TableNotFoundException`,
 `SchemaMismatchException`, `ArrowBridgeException`, `ParquetException`, `ObjectStoreException`,
-`ResourceException`, `QueryCancelledException`, `EngineClosedException`, base
-`DataFusionException`). No raw JNI/native errors reach application code.
+`ResourceException`, `QueryCancelledException`, `EngineClosedException`,
+`QueryNotFoundException`, base `DataFusionException`). No raw JNI/native errors reach
+application code.
+
+Every JNI entry point runs inside `ffi::jni_guard!`, which catches a Rust panic and throws it as
+a `DataFusionException` rather than letting it unwind across the `extern "system"` boundary
+(which would abort the whole JVM). A panic is a bug, but it degrades to a normal Java exception.

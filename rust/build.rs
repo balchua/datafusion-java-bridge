@@ -1,4 +1,3 @@
-
 fn main() {
     // Capture the rustc version used to build the engine so the benchmark harness
     // can record it in its output.

@@ -151,6 +151,7 @@ public final class BenchmarkMain {
         Path scratchDir = Path.of(System.getProperty("java.io.tmpdir"), "dfe-scratch");
         long memoryLimitBytes = 0;
         boolean zeroCopy = true; // zero-copy is the default
+        boolean validateIngest = false; // off by default (matches the library default)
         String dumpParquet; // optional: export loaded tables to Parquet for inspection
         String s3Bucket;
         String s3Endpoint;
@@ -175,7 +176,8 @@ public final class BenchmarkMain {
             EngineConfig.Builder b = EngineConfig.builder()
                     .memoryLimitBytes(memoryLimitBytes)
                     .scratchDir(scratchDir.toString())
-                    .zeroCopyIngest(zeroCopy);
+                    .zeroCopyIngest(zeroCopy)
+                    .validateOnIngest(validateIngest);
             if (s3Bucket != null) {
                 b.s3(s3 -> {
                     if (s3Endpoint != null) {
@@ -206,6 +208,8 @@ public final class BenchmarkMain {
                     case "--profile" -> p.profile = args[++i];
                     case "--zero-copy" -> p.zeroCopy = true;
                     case "--deep-copy" -> p.zeroCopy = false;
+                    case "--validate-ingest" -> p.validateIngest = true;
+                    case "--no-validate-ingest" -> p.validateIngest = false;
                     case "--dump-parquet" -> p.dumpParquet = args[++i];
                     case "--queries" -> {
                         String value = args[++i].trim();
@@ -269,6 +273,9 @@ public final class BenchmarkMain {
                             --zero-copy                         zero-copy Arrow ingest (default; no Rust deep copy)
                             --deep-copy                         deep-copy ingest (Rust owns a copy; Java may
                                                                 reuse/free buffers immediately)
+                            --validate-ingest                   validate Arrow on ingest (default off; on adds an
+                                                                O(rows) scan that makes load non-flat)
+                            --no-validate-ingest                explicit opt-out (the default)
 
                           Queries:
                             --queries all|q1,q3,q5             which SQLs to run (default: none = LOAD only)

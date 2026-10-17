@@ -5,10 +5,14 @@ import io.github.balchua.datafusion.engine.EngineConfig;
 
 import io.github.balchua.datafusion.exception.DataFusionException;
 import io.github.balchua.datafusion.exception.EngineClosedException;
+import io.github.balchua.datafusion.exception.QueryNotFoundException;
+import io.github.balchua.datafusion.exception.SchemaMismatchException;
 import io.github.balchua.datafusion.exception.SqlParseException;
 import io.github.balchua.datafusion.exception.SqlUnsupportedException;
 import io.github.balchua.datafusion.exception.TableNotFoundException;
-import io.github.balchua.datafusion.engine.NativeEngine;
+import io.github.balchua.datafusion.engine.TestNativeAccess;
+import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.memory.RootAllocator;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
@@ -53,14 +57,29 @@ class ErrorMappingTest {
     }
 
     @Test
-    void unknownQueryIdThrowsEngineClosed() {
+    void unknownQueryIdThrowsQueryNotFound() {
         try (DataFusionEngine engine = new DataFusionEngine(EngineConfig.defaults())) {
-            long handle = engine.nativeHandle();
+            long handle = TestNativeAccess.handle(engine);
             long[] arrayAddrs = new long[0];
             DataFusionException e = assertThrows(DataFusionException.class,
-                    () -> NativeEngine.resultNextBatch(handle, 999_999L, arrayAddrs));
-            assertInstanceOf(EngineClosedException.class, e);
+                    () -> TestNativeAccess.resultNextBatch(handle, 999_999L, arrayAddrs));
+            // A bad query id on a live engine is a distinct condition from a closed engine.
+            assertInstanceOf(QueryNotFoundException.class, e);
             assertTrue(e.getMessage().contains("not registered"));
+        }
+    }
+
+    @Test
+    void schemaMismatchMapping() {
+        BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+        try (DataFusionEngine engine = new DataFusionEngine(EngineConfig.defaults());
+             SchoolData.Dataset data = SchoolData.build(allocator, "mm", 2, 3)) {
+            // An empty table name is rejected in native staging as a schema/registration error.
+            assertInstanceOf(SchemaMismatchException.class,
+                    assertThrows(DataFusionException.class,
+                            () -> engine.registerArrow("", data.students())));
+        } finally {
+            allocator.close();
         }
     }
 

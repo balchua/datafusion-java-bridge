@@ -16,12 +16,10 @@
 //! structs hold `Arc` references to the buffers, so they stay alive until Java closes
 //! the imported vectors, which triggers the release callbacks and frees Rust buffers.
 
-use datafusion::arrow::array::{make_array, ArrayData, RecordBatch};
 use arrow::buffer::{BooleanBuffer, Buffer, MutableBuffer, NullBuffer};
-use datafusion::arrow::ffi::{
-    from_ffi_and_data_type, to_ffi, FFI_ArrowArray, FFI_ArrowSchema,
-};
+use datafusion::arrow::array::{make_array, ArrayData, RecordBatch};
 use datafusion::arrow::datatypes::Schema;
+use datafusion::arrow::ffi::{from_ffi_and_data_type, to_ffi, FFI_ArrowArray, FFI_ArrowSchema};
 use std::sync::Arc;
 
 use crate::error::{EngineError, ErrorKind, Result};
@@ -52,6 +50,10 @@ fn copy_buffer(source: &Buffer) -> Buffer {
 ///   Java's release callback). Zero-copy requires the Java buffers to remain unmodified
 ///   for the batch's lifetime; `align_buffers()` may still copy individual misaligned
 ///   buffers.
+/// * `validate` - `true`: run `ArrayData::validate_full()` on each imported column before
+///   use, rejecting malformed layouts (out-of-range offsets, invalid UTF-8, bad dictionary
+///   keys) that would otherwise be undefined behaviour. Costs O(rows). Deep-copy mode
+///   validates regardless, because it reads the declared buffers/offsets.
 ///
 /// The imported C structs are consumed (per the C data interface "move" semantics) and
 /// released before this function returns for the schema (which is always materialized
@@ -60,14 +62,24 @@ pub fn import_batch(
     schema_ptr: usize,
     array_ptrs: &[usize],
     copy: bool,
+    validate: bool,
 ) -> Result<(Schema, RecordBatch)> {
+    if schema_ptr == 0 {
+        return Err(bridge_error("null ArrowSchema pointer"));
+    }
+    for (i, ptr) in array_ptrs.iter().enumerate() {
+        if *ptr == 0 {
+            return Err(bridge_error(format!(
+                "null ArrowArray pointer for column {i}"
+            )));
+        }
+    }
     // SAFETY: `schema_ptr` points at a fully initialized `ArrowSchema` written by Arrow
     // Java's exporter. `from_raw` atomically replaces the struct contents with an empty
     // struct (release = NULL), so Java-side code can safely close/free its own struct
     // memory afterwards without double-release. We own the original contents from here on;
     // dropping the `FFI_ArrowSchema` invokes Java's release callback.
-    let ffi_schema =
-        unsafe { FFI_ArrowSchema::from_raw(schema_ptr as *mut FFI_ArrowSchema) };
+    let ffi_schema = unsafe { FFI_ArrowSchema::from_raw(schema_ptr as *mut FFI_ArrowSchema) };
     let schema = Schema::try_from(&ffi_schema)
         .map_err(|e| bridge_error(format!("schema import failed: {e}")))?;
     drop(ffi_schema); // release callback -> Java frees schema private data
@@ -85,10 +97,21 @@ pub fn import_batch(
         // SAFETY: same contract as `ffi_schema` above; `from_raw` consumes the struct
         // contents and we are responsible for dropping it (which releases Java refs).
         let ffi_array = unsafe { FFI_ArrowArray::from_raw(*ptr as *mut FFI_ArrowArray) };
-        let imported = unsafe {
-            from_ffi_and_data_type(ffi_array, schema.field(i).data_type().clone())
+        let imported =
+            unsafe { from_ffi_and_data_type(ffi_array, schema.field(i).data_type().clone()) }
+                .map_err(|e| bridge_error(format!("array import failed for column {i}: {e}")))?;
+
+        // The C Data Interface import is unchecked (arrow-rs `from_ffi*` builds the
+        // ArrayData with `new_unchecked`), so a malformed layout — out-of-range offsets,
+        // invalid UTF-8, bad dictionary keys — would otherwise be undefined behaviour when
+        // DataFusion reads it. Validate before use. Also always validate before a deep
+        // copy: `deep_copy` reads the declared buffers/offsets and could copy out of
+        // bounds first.
+        if validate || copy {
+            imported
+                .validate_full()
+                .map_err(|e| bridge_error(format!("column {i} failed Arrow validation: {e}")))?;
         }
-        .map_err(|e| bridge_error(format!("array import failed for column {i}: {e}")))?;
 
         let data = if copy {
             // Deep-copy mode: Java's buffers are copied into Rust-owned memory so
@@ -145,6 +168,9 @@ fn deep_copy(data: &ArrayData) -> Result<ArrayData> {
 /// The exported schema is struct-typed (children = record fields), which is what Arrow
 /// Java's `Data.importSchema` expects for a record batch schema.
 pub fn export_schema(schema: &Schema, out_ptr: usize) -> Result<()> {
+    if out_ptr == 0 {
+        return Err(bridge_error("null ArrowSchema output pointer"));
+    }
     let ffi = FFI_ArrowSchema::try_from(schema)
         .map_err(|e| bridge_error(format!("schema export failed: {e}")))?;
     // SAFETY: `out_ptr` points at Java-allocated `ArrowSchema` struct memory. `ptr::write`
@@ -155,21 +181,67 @@ pub fn export_schema(schema: &Schema, out_ptr: usize) -> Result<()> {
     Ok(())
 }
 
-/// Exports one column of a record batch into a Java-allocated `ArrowArray` struct.
+/// Builds the exported `FFI_ArrowArray` for a column *without* writing it anywhere.
 ///
-/// The exported struct holds `Arc` clones of the column's buffers, so the data outlives
-/// the batch this column came from; Java closing the imported vector triggers the release
-/// callback that frees them.
-pub fn export_column(data: &ArrayData, out_ptr: usize) -> Result<()> {
-    let (array, _schema) = to_ffi(data)
-        .map_err(|e| bridge_error(format!("column export failed: {e}")))?;
-    // The schema half is not needed (Java caches the schema from the first import);
-    // dropping it releases the schema's private data.
-    drop(_schema);
+/// Used by [`export_columns_atomic`] so a batch is only committed to Java memory once
+/// every column has been successfully converted (all-or-nothing export).
+pub fn column_to_ffi(data: &ArrayData) -> Result<FFI_ArrowArray> {
+    // The second tuple element is the schema half; it is dropped at the end of this
+    // statement, releasing its private data (Java caches the schema from the first import).
+    let (array, _) =
+        to_ffi(data).map_err(|e| bridge_error(format!("column export failed: {e}")))?;
+    Ok(array)
+}
+
+/// Writes a pre-built `FFI_ArrowArray` into Java-allocated struct memory.
+pub fn write_column(array: FFI_ArrowArray, out_ptr: usize) -> Result<()> {
+    if out_ptr == 0 {
+        // The struct is dropped here, releasing its buffers — nothing is leaked.
+        return Err(bridge_error("null ArrowArray output pointer"));
+    }
     // SAFETY: `out_ptr` points at Java-allocated `ArrowArray` struct memory. Same move
-    // semantics as `export_schema`.
+    // semantics as `export_schema`; ownership of the release callback transfers to Java.
     unsafe { std::ptr::write(out_ptr as *mut FFI_ArrowArray, array) };
     Ok(())
+}
+
+/// Exports a whole record batch's columns into Java-allocated `ArrowArray` structs
+/// all-or-nothing: every column is converted first, and only if all succeed are they
+/// written into the caller's memory. A failure part-way therefore cannot leave live,
+/// un-released FFI structs in Java-owned memory.
+pub fn export_columns_atomic(columns: &[&ArrayData], out_ptrs: &[usize]) -> Result<()> {
+    if columns.len() != out_ptrs.len() {
+        return Err(bridge_error(format!(
+            "column count mismatch: {} columns, {} output pointers",
+            columns.len(),
+            out_ptrs.len()
+        )));
+    }
+    // Validate every output pointer BEFORE building/writing anything, so the write loop
+    // below can never fail once started: a null in a later slot must not leave earlier
+    // columns already committed into Java memory (which Java, seeing an exception, would
+    // never release).
+    if let Some(i) = out_ptrs.iter().position(|p| *p == 0) {
+        return Err(bridge_error(format!(
+            "null ArrowArray output pointer for column {i}"
+        )));
+    }
+    let mut built = Vec::with_capacity(columns.len());
+    for data in columns {
+        built.push(column_to_ffi(data)?); // any error here drops `built` -> nothing written
+    }
+    for (array, ptr) in built.into_iter().zip(out_ptrs.iter()) {
+        write_column(array, *ptr)?;
+    }
+    Ok(())
+}
+
+/// Exports one column of a record batch into a Java-allocated `ArrowArray` struct.
+///
+/// Used only by tests; production export goes through [`export_columns_atomic`].
+#[cfg(test)]
+pub(crate) fn export_column(data: &ArrayData, out_ptr: usize) -> Result<()> {
+    write_column(column_to_ffi(data)?, out_ptr)
 }
 
 #[cfg(test)]
@@ -200,7 +272,11 @@ mod tests {
 
         import_batch(
             schema_mem.as_ptr() as usize,
-            &array_mems.iter().map(|b| b.as_ptr() as usize).collect::<Vec<_>>(),
+            &array_mems
+                .iter()
+                .map(|b| b.as_ptr() as usize)
+                .collect::<Vec<_>>(),
+            true,
             true,
         )
         .unwrap()
@@ -249,7 +325,11 @@ mod tests {
             Arc::new(Field::new("quantity", DataType::Int32, true)),
             Arc::new(Field::new("big", DataType::Int64, true)),
             Arc::new(Field::new("flag", DataType::Boolean, true)),
-            Arc::new(Field::new("created", DataType::Timestamp(TimeUnit::Millisecond, None), true)),
+            Arc::new(Field::new(
+                "created",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                true,
+            )),
             Arc::new(Field::new("exec_date", DataType::Date32, true)),
             Arc::new(Field::new_struct(
                 "debtor",
@@ -265,7 +345,10 @@ mod tests {
         let debtor_account = StructArray::from(vec![
             (
                 Arc::new(Field::new("iban", DataType::Utf8, true)),
-                Arc::new(StringArray::from(vec![Some("DE89370400440532013000"), None])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("DE89370400440532013000"),
+                    None,
+                ])) as ArrayRef,
             ),
             (
                 Arc::new(Field::new("number", DataType::Utf8, true)),
@@ -278,7 +361,11 @@ mod tests {
                 Arc::new(StringArray::from(vec![Some("AAA"), Some("BBB")])) as ArrayRef,
             ),
             (
-                Arc::new(Field::new("account", account_field.data_type().clone(), true)),
+                Arc::new(Field::new(
+                    "account",
+                    account_field.data_type().clone(),
+                    true,
+                )),
                 Arc::new(debtor_account) as ArrayRef,
             ),
         ]);
@@ -287,11 +374,19 @@ mod tests {
         let items = StructArray::from(vec![
             (
                 Arc::new(Field::new("code", DataType::Utf8, true)),
-                Arc::new(StringArray::from(vec![Some("SCOR"), Some("SCOR"), Some("SCOR")])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("SCOR"),
+                    Some("SCOR"),
+                    Some("SCOR"),
+                ])) as ArrayRef,
             ),
             (
                 Arc::new(Field::new("reference", DataType::Utf8, true)),
-                Arc::new(StringArray::from(vec![Some("REF-1"), Some("REF-2"), Some("REF-3")])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("REF-1"),
+                    Some("REF-2"),
+                    Some("REF-3"),
+                ])) as ArrayRef,
             ),
             (
                 Arc::new(Field::new("amount", DataType::Decimal128(18, 4), true)),
@@ -309,22 +404,28 @@ mod tests {
             Some(arrow::buffer::NullBuffer::from(vec![true, false])),
         );
 
-        let batch = RecordBatch::try_new(Arc::new(schema), vec![
-            Arc::new(StringArray::from(vec!["TXN-1", "TXN-2"])),
-            Arc::new(
-                Decimal128Array::from(vec![Some(1000050), None])
-                    .with_precision_and_scale(18, 4)
-                    .unwrap(),
-            ),
-            Arc::new(StringArray::from(vec![Some("EUR"), None])),
-            Arc::new(Int32Array::from(vec![Some(1), Some(2)])),
-            Arc::new(Int64Array::from(vec![Some(9876543210), Some(-5)])),
-            Arc::new(BooleanArray::from(vec![Some(true), None])),
-            Arc::new(TimestampMillisecondArray::from(vec![Some(1772995200000), None])),
-            Arc::new(Date32Array::from(vec![Some(20000), None])),
-            Arc::new(debtor),
-            Arc::new(list),
-        ])
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from(vec!["TXN-1", "TXN-2"])),
+                Arc::new(
+                    Decimal128Array::from(vec![Some(1000050), None])
+                        .with_precision_and_scale(18, 4)
+                        .unwrap(),
+                ),
+                Arc::new(StringArray::from(vec![Some("EUR"), None])),
+                Arc::new(Int32Array::from(vec![Some(1), Some(2)])),
+                Arc::new(Int64Array::from(vec![Some(9876543210), Some(-5)])),
+                Arc::new(BooleanArray::from(vec![Some(true), None])),
+                Arc::new(TimestampMillisecondArray::from(vec![
+                    Some(1772995200000),
+                    None,
+                ])),
+                Arc::new(Date32Array::from(vec![Some(20000), None])),
+                Arc::new(debtor),
+                Arc::new(list),
+            ],
+        )
         .unwrap();
 
         let out = round_trip(&batch);
@@ -352,7 +453,88 @@ mod tests {
 
         // The schema declares one field but no array structs are supplied. The import must
         // return a typed error (never unwind across the FFI boundary) and consume the schema.
-        let err = import_batch(schema_mem.as_ptr() as usize, &[], false).unwrap_err();
+        let err = import_batch(schema_mem.as_ptr() as usize, &[], false, true).unwrap_err();
         assert_eq!(err.kind, ErrorKind::ArrowBridge);
+    }
+
+    #[test]
+    fn rejects_null_ffi_pointers() {
+        use crate::error::ErrorKind;
+
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
+        // Null schema pointer.
+        assert_eq!(
+            import_batch(0, &[], false, true).unwrap_err().kind,
+            ErrorKind::ArrowBridge
+        );
+        // Null output schema pointer.
+        assert_eq!(
+            export_schema(&schema, 0).unwrap_err().kind,
+            ErrorKind::ArrowBridge
+        );
+
+        // Null array pointer for a supplied column.
+        let mut schema_mem = [0usize; 24];
+        export_schema(&schema, schema_mem.as_mut_ptr() as usize).unwrap();
+        assert_eq!(
+            import_batch(schema_mem.as_ptr() as usize, &[0], false, true)
+                .unwrap_err()
+                .kind,
+            ErrorKind::ArrowBridge
+        );
+    }
+
+    #[test]
+    fn export_columns_atomic_checks_arity_and_null_output() {
+        use crate::error::ErrorKind;
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)])),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef],
+        )
+        .unwrap();
+        let data = batch.column(0).to_data();
+
+        // More output pointers than columns.
+        assert_eq!(
+            export_columns_atomic(&[&data], &[0, 0]).unwrap_err().kind,
+            ErrorKind::ArrowBridge
+        );
+        // Correct arity but a null output pointer: nothing should be written and the
+        // built struct is dropped (released) rather than leaked.
+        assert_eq!(
+            export_columns_atomic(&[&data], &[0]).unwrap_err().kind,
+            ErrorKind::ArrowBridge
+        );
+    }
+
+    #[test]
+    fn export_columns_atomic_rejects_null_in_non_leading_slot_before_writing() {
+        use crate::error::ErrorKind;
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Int32, true),
+                Field::new("b", DataType::Int32, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![4, 5, 6])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let a = batch.column(0).to_data();
+        let b = batch.column(1).to_data();
+
+        // A null in a NON-leading slot must fail before anything is written: the valid
+        // first target must stay untouched (a partial write would leak columns the
+        // caller, seeing an error, never releases).
+        let mut first = [0usize; 24];
+        let err = export_columns_atomic(&[&a, &b], &[first.as_mut_ptr() as usize, 0]).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::ArrowBridge);
+        assert!(
+            first.iter().all(|w| *w == 0),
+            "export partially wrote a column before rejecting a later null pointer"
+        );
     }
 }

@@ -58,8 +58,10 @@ extension at `**/pom.xml` (it imports `java/pom.xml`) and rust-analyzer at
 `rust/Cargo.toml`. After structural changes run `Java: Clean Java Language Server
 Workspace` and reload the window. Keep the workspace in Trusted mode.
 
-Library loading order (`NativeEngine`): system property `dfe.native.library` → env
-`DFE_NATIVE_LIBRARY` → `java.library.path` → `rust/target/release`.
+Library loading order (`NativeEngine`): system property `dfe.native.library` (must be an
+absolute path) → env `DFE_NATIVE_LIBRARY` → `java.library.path`. The `rust/target/release`
+development probe runs only with `-Ddfe.native.dev=true` (tests and the benchmark set it),
+so a writable working directory cannot supply the library in production.
 
 ## Run tests
 

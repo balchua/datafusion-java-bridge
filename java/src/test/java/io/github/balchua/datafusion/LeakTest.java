@@ -2,7 +2,7 @@ package io.github.balchua.datafusion;
 
 import io.github.balchua.datafusion.engine.DataFusionEngine;
 import io.github.balchua.datafusion.engine.EngineConfig;
-import io.github.balchua.datafusion.engine.NativeEngine;
+import io.github.balchua.datafusion.engine.TestNativeAccess;
 import io.github.balchua.datafusion.engine.QueryResult;
 import io.github.balchua.datafusion.exception.ArrowBridgeException;
 import io.github.balchua.datafusion.exception.DataFusionException;
@@ -46,8 +46,8 @@ class LeakTest {
                 ArrowArray array = ArrowArray.allocateNew(allocator);
                 try {
                     Data.exportVector(allocator, data.students().getVector(0), null, array);
-                    assertThrows(ArrowBridgeException.class, () -> NativeEngine.stageArrow(
-                            engine.nativeHandle(), "t", schema.memoryAddress(),
+                    assertThrows(ArrowBridgeException.class, () -> TestNativeAccess.stageArrow(
+                            TestNativeAccess.handle(engine), "t", schema.memoryAddress(),
                             new long[] {array.memoryAddress()}));
                 } finally {
                     array.release();

@@ -48,7 +48,7 @@ mvn -q -pl java dependency:copy-dependencies \
 java \
     --enable-native-access=ALL-UNNAMED \
     --add-opens=java.base/java.nio=ALL-UNNAMED \
-    -Dio.netty.tryReflectionSetAccessible=true \
+    -Ddfe.native.dev=true \
     ${DFE_JVM_OPTS:-} \
     -cp "java/target/classes:java/target/test-classes:java/target/bench-libs/*" \
     io.github.balchua.datafusion.bench.BenchmarkMain "$@"

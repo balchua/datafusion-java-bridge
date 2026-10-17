@@ -1,9 +1,14 @@
 package io.github.balchua.datafusion.exception;
 
-/** ParquetException. Thrown by the native engine; see docs/architecture.md for the error map. */
+/** Thrown when a Parquet file cannot be read, encoded, or written. */
 public class ParquetException extends DataFusionException {
     private static final long serialVersionUID = 1L;
+
     public ParquetException(String message) {
         super(message);
+    }
+
+    public ParquetException(String message, Throwable cause) {
+        super(message, cause);
     }
 }
